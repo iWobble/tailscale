@@ -50,7 +50,7 @@ require (
 	github.com/hdevalence/ed25519consensus v0.2.0
 	github.com/illarion/gonotify/v3 v3.0.2
 	github.com/inetaf/tcpproxy v0.0.0-20250203165043-ded522cbd03f
-	github.com/insomniacslk/dhcp v0.0.0-20231206064809-8c70d406f6d2
+	github.com/insomniacslk/dhcp v0.0.0-20250109001534-8abf58130905
 	github.com/jellydator/ttlcache/v3 v3.1.0
 	github.com/jsimonetti/rtnetlink v1.4.0
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
