@@ -37,7 +37,7 @@ require (
 	github.com/go-json-experiment/json v0.0.0-20250103232110-6a9a0fde9288
 	github.com/go-logr/zapr v1.3.0
 	github.com/go-ole/go-ole v1.3.0
-	github.com/godbus/dbus/v5 v5.1.1-0.20230522191255-76236955d466
+	github.com/godbus/dbus/v5 v5.1.1-0.20241109141217-c266b19b28e9
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da
 	github.com/golang/snappy v0.0.4
 	github.com/golangci/golangci-lint v1.57.1
