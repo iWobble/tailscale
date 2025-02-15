@@ -77,7 +77,7 @@ require (
 	github.com/tailscale/depaware v0.0.0-20250112153213-b748de04d81b
 	github.com/tailscale/goexpect v0.0.0-20210902213824-6e8c725cea41
 	github.com/tailscale/golang-x-crypto v0.0.0-20240604161659-3fde5e568aa4
-	github.com/tailscale/goupnp v1.0.1-0.20210804011211-c64d0f06ea05
+	github.com/tailscale/goupnp v1.0.1-0.20210804030727-66b27ba4e403
 	github.com/tailscale/hujson v0.0.0-20221223112325-20486734a56a
 	github.com/tailscale/mkctr v0.0.0-20250110151924-54977352e4a6
 	github.com/tailscale/netlink v1.1.1-0.20240822203006-4d49adab4de7
