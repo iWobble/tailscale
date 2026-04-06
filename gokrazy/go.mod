@@ -2,7 +2,7 @@ module tailscale.com/gokrazy
 
 go 1.23.1
 
-require github.com/gokrazy/tools v0.0.0-20240730192548-9f81add3a91e
+require github.com/gokrazy/tools v0.0.0-20260406155313-5861e2403dc8
 
 require (
 	github.com/breml/rootcerts v0.2.10 // indirect
