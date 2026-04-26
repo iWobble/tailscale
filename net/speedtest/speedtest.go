@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package speedtest contains both server and client code for
@@ -24,7 +24,7 @@ const (
 // conduct the test.
 type config struct {
 	Version      int           `json:"version"`
-	TestDuration time.Duration `json:"time"`
+	TestDuration time.Duration `json:"time,format:nano"`
 	Direction    Direction     `json:"direction"`
 }
 

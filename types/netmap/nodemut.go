@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netmap
@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/ptr"
 )
 
 // NodeMutation is the common interface for types that describe
@@ -37,7 +36,7 @@ func (m NodeMutationDERPHome) Apply(n *tailcfg.Node) {
 	n.HomeDERP = m.DERPRegion
 }
 
-// NodeMutation is a NodeMutation that says a node's endpoints have changed.
+// NodeMutationEndpoints is a NodeMutation that says a node's endpoints have changed.
 type NodeMutationEndpoints struct {
 	mutatingNodeID
 	Endpoints []netip.AddrPort
@@ -55,7 +54,7 @@ type NodeMutationOnline struct {
 }
 
 func (m NodeMutationOnline) Apply(n *tailcfg.Node) {
-	n.Online = ptr.To(m.Online)
+	n.Online = new(m.Online)
 }
 
 // NodeMutationLastSeen is a NodeMutation that says a node's LastSeen
@@ -66,14 +65,14 @@ type NodeMutationLastSeen struct {
 }
 
 func (m NodeMutationLastSeen) Apply(n *tailcfg.Node) {
-	n.LastSeen = ptr.To(m.LastSeen)
+	n.LastSeen = new(m.LastSeen)
 }
 
 var peerChangeFields = sync.OnceValue(func() []reflect.StructField {
 	var fields []reflect.StructField
 	rt := reflect.TypeFor[tailcfg.PeerChange]()
-	for i := range rt.NumField() {
-		fields = append(fields, rt.Field(i))
+	for field := range rt.Fields() {
+		fields = append(fields, field)
 	}
 	return fields
 })
@@ -163,6 +162,7 @@ func mapResponseContainsNonPatchFields(res *tailcfg.MapResponse) bool {
 		res.PacketFilters != nil ||
 		res.UserProfiles != nil ||
 		res.Health != nil ||
+		res.DisplayMessages != nil ||
 		res.SSHPolicy != nil ||
 		res.TKAInfo != nil ||
 		res.DomainDataPlaneAuditLogID != "" ||
@@ -176,5 +176,5 @@ func mapResponseContainsNonPatchFields(res *tailcfg.MapResponse) bool {
 		// function is called, so it should never be set anyway. But for
 		// completedness, and for tests, check it too:
 		res.PeersChanged != nil ||
-		res.DefaultAutoUpdate != ""
+		res.DeprecatedDefaultAutoUpdate != ""
 }

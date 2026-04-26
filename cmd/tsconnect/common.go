@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -176,6 +176,10 @@ func runEsbuild(buildOptions esbuild.BuildOptions) esbuild.BuildResult {
 // wasm_exec.js runtime helper library from the Go toolchain.
 func setupEsbuildWasmExecJS(build esbuild.PluginBuild) {
 	wasmExecSrcPath := filepath.Join(runtime.GOROOT(), "misc", "wasm", "wasm_exec.js")
+	if _, err := os.Stat(wasmExecSrcPath); os.IsNotExist(err) {
+		// Go 1.24+ location:
+		wasmExecSrcPath = filepath.Join(runtime.GOROOT(), "lib", "wasm", "wasm_exec.js")
+	}
 	build.OnResolve(esbuild.OnResolveOptions{
 		Filter: "./wasm_exec$",
 	}, func(args esbuild.OnResolveArgs) (esbuild.OnResolveResult, error) {
@@ -265,7 +269,7 @@ func runWasmOpt(path string) error {
 		return fmt.Errorf("Cannot stat %v: %w", path, err)
 	}
 	startSize := stat.Size()
-	cmd := exec.Command("../../tool/wasm-opt", "--enable-bulk-memory", "-Oz", path, "-o", path)
+	cmd := exec.Command("../../tool/wasm-opt", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "-Oz", path, "-o", path)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()

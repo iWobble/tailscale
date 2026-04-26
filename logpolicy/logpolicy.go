@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package logpolicy manages the creation or reuse of logtail loggers,
@@ -9,7 +9,6 @@ package logpolicy
 import (
 	"bufio"
 	"bytes"
-	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -32,6 +31,8 @@ import (
 	"golang.org/x/term"
 	"tailscale.com/atomicfile"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/log/filelogger"
@@ -42,16 +43,18 @@ import (
 	"tailscale.com/net/netknob"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
-	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/must"
 	"tailscale.com/util/racebuild"
-	"tailscale.com/util/syspolicy"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/testenv"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
@@ -65,7 +68,7 @@ var getLogTargetOnce struct {
 func getLogTarget() string {
 	getLogTargetOnce.Do(func() {
 		envTarget, _ := os.LookupEnv("TS_LOG_TARGET")
-		getLogTargetOnce.v, _ = syspolicy.GetString(syspolicy.LogTarget, envTarget)
+		getLogTargetOnce.v, _ = policyclient.Get().GetString(pkey.LogTarget, envTarget)
 	})
 
 	return getLogTargetOnce.v
@@ -105,6 +108,7 @@ type Policy struct {
 	// Logtail is the logger.
 	Logtail *logtail.Logger
 	// PublicID is the logger's instance identifier.
+	// It may be the zero value if logging is not in use.
 	PublicID logid.PublicID
 	// Logf is where to write informational messages about this Logger.
 	Logf logger.Logf
@@ -189,8 +193,8 @@ type logWriter struct {
 	logger *log.Logger
 }
 
-func (l logWriter) Write(buf []byte) (int, error) {
-	l.logger.Printf("%s", buf)
+func (lg logWriter) Write(buf []byte) (int, error) {
+	lg.logger.Printf("%s", buf)
 	return len(buf), nil
 }
 
@@ -224,6 +228,9 @@ func LogsDir(logf logger.Logf) string {
 		logf("logpolicy: using LocalAppData dir %v", dir)
 		return dir
 	case "linux":
+		if distro.Get() == distro.JetKVM {
+			return "/userdata/tailscale/var"
+		}
 		// STATE_DIRECTORY is set by systemd 240+ but we support older
 		// systems-d. For example, Ubuntu 18.04 (Bionic Beaver) is 237.
 		systemdStateDir := os.Getenv("STATE_DIRECTORY")
@@ -460,18 +467,6 @@ func New(collection string, netMon *netmon.Monitor, health *health.Tracker, logf
 	}.New()
 }
 
-// Deprecated: Use [Options.New] instead.
-func NewWithConfigPath(collection, dir, cmdName string, netMon *netmon.Monitor, health *health.Tracker, logf logger.Logf) *Policy {
-	return Options{
-		Collection: collection,
-		Dir:        dir,
-		CmdName:    cmdName,
-		NetMon:     netMon,
-		Health:     health,
-		Logf:       logf,
-	}.New()
-}
-
 // Options is used to construct a [Policy].
 type Options struct {
 	// Collection is a required collection to upload logs under.
@@ -495,6 +490,11 @@ type Options struct {
 	// If non-nil, it's used to construct the default HTTP client.
 	Health *health.Tracker
 
+	// Bus is an optional parameter for communication on the eventbus.
+	// If non-nil, it's passed to logtail for use in interface monitoring.
+	// TODO(cmol): Make this non-optional when it's plumbed in by the clients.
+	Bus *eventbus.Bus
+
 	// Logf is an optional logger to use.
 	// If nil, [log.Printf] will be used instead.
 	Logf logger.Logf
@@ -517,8 +517,9 @@ type Options struct {
 	MaxUploadSize int
 }
 
-// New returns a new log policy (a logger and its instance ID).
-func (opts Options) New() *Policy {
+// init initializes the log policy and returns a logtail.Config and the
+// Policy.
+func (opts Options) init(disableLogging bool) (*logtail.Config, *Policy) {
 	if hostinfo.IsNATLabGuestVM() {
 		// In NATLab Gokrazy instances, tailscaled comes up concurently with
 		// DHCP and the doesn't have DNS for a while. Wait for DHCP first.
@@ -620,6 +621,7 @@ func (opts Options) New() *Policy {
 		Stderr:        logWriter{console},
 		CompressLogs:  true,
 		MaxUploadSize: opts.MaxUploadSize,
+		Bus:           opts.Bus,
 	}
 	if opts.Collection == logtail.CollectionNode {
 		conf.MetricsDelta = clientmetric.EncodeLogTailMetricsDelta
@@ -627,7 +629,7 @@ func (opts Options) New() *Policy {
 		conf.IncludeProcSequence = true
 	}
 
-	if envknob.NoLogsNoSupport() || testenv.InTest() {
+	if disableLogging {
 		opts.Logf("You have disabled logging. Tailscale will not be able to provide support.")
 		conf.HTTPC = &http.Client{Transport: noopPretendSuccessTransport{}}
 	} else {
@@ -636,14 +638,21 @@ func (opts Options) New() *Policy {
 		attachFilchBuffer(&conf, opts.Dir, opts.CmdName, opts.MaxBufferSize, opts.Logf)
 		conf.HTTPC = opts.HTTPC
 
-		if conf.HTTPC == nil {
-			logHost := logtail.DefaultHost
-			if val := getLogTarget(); val != "" {
+		logHost := logtail.DefaultHost
+		if val := getLogTarget(); val != "" {
+			u, err := url.Parse(val)
+			if err != nil {
+				opts.Logf("logpolicy: invalid TS_LOG_TARGET %q: %v; using default log host", val, err)
+			} else if u.Host == "" {
+				opts.Logf("logpolicy: invalid TS_LOG_TARGET %q: missing host; using default log host", val)
+			} else {
 				opts.Logf("You have enabled a non-default log target. Doing without being told to by Tailscale staff or your network administrator will make getting support difficult.")
 				conf.BaseURL = val
-				u, _ := url.Parse(val)
 				logHost = u.Host
 			}
+		}
+
+		if conf.HTTPC == nil {
 			conf.HTTPC = &http.Client{Transport: TransportOptions{
 				Host:   logHost,
 				NetMon: opts.NetMon,
@@ -679,11 +688,18 @@ func (opts Options) New() *Policy {
 		opts.Logf("%s", earlyErrBuf.Bytes())
 	}
 
-	return &Policy{
+	return &conf, &Policy{
 		Logtail:  lw,
 		PublicID: newc.PublicID,
 		Logf:     opts.Logf,
 	}
+}
+
+// New returns a new log policy (a logger and its instance ID).
+func (opts Options) New() *Policy {
+	disableLogging := envknob.NoLogsNoSupport() || testenv.InTest() || runtime.GOOS == "plan9" || !buildfeatures.HasLogTail
+	_, policy := opts.init(disableLogging)
+	return policy
 }
 
 // attachFilchBuffer creates an on-disk ring buffer using filch and attaches
@@ -769,7 +785,7 @@ func (p *Policy) Shutdown(ctx context.Context) error {
 //
 // The netMon parameter is optional. It should be specified in environments where
 // Tailscaled is manipulating the routing table.
-func MakeDialFunc(netMon *netmon.Monitor, logf logger.Logf) func(ctx context.Context, netw, addr string) (net.Conn, error) {
+func MakeDialFunc(netMon *netmon.Monitor, logf logger.Logf) netx.DialFunc {
 	if netMon == nil {
 		netMon = netmon.NewStatic()
 	}
@@ -855,7 +871,7 @@ type TransportOptions struct {
 // New returns an HTTP Transport particularly suited to uploading logs
 // to the given host name. See [DialContext] for details on how it works.
 func (opts TransportOptions) New() http.RoundTripper {
-	if testenv.InTest() {
+	if testenv.InTest() || envknob.NoLogsNoSupport() {
 		return noopPretendSuccessTransport{}
 	}
 	if opts.NetMon == nil {
@@ -867,8 +883,12 @@ func (opts TransportOptions) New() http.RoundTripper {
 		tr.TLSClientConfig = opts.TLSClientConfig.Clone()
 	}
 
-	tr.Proxy = tshttpproxy.ProxyFromEnvironment
-	tshttpproxy.SetTransportGetProxyConnectHeader(tr)
+	if buildfeatures.HasUseProxy {
+		tr.Proxy = feature.HookProxyFromEnvironment.GetOrNil()
+		if set, ok := feature.HookProxySetTransportGetProxyConnectHeader.GetOk(); ok {
+			set(tr)
+		}
+	}
 
 	// We do our own zstd compression on uploads, and responses never contain any payload,
 	// so don't send "Accept-Encoding: gzip" to save a few bytes on the wire, since there
@@ -901,8 +921,7 @@ func (opts TransportOptions) New() http.RoundTripper {
 		tr.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
 	}
 
-	host := cmp.Or(opts.Host, logtail.DefaultHost)
-	tr.TLSClientConfig = tlsdial.Config(host, opts.Health, tr.TLSClientConfig)
+	tr.TLSClientConfig = tlsdial.Config(opts.Health, tr.TLSClientConfig)
 	// Force TLS 1.3 since we know log.tailscale.com supports it.
 	tr.TLSClientConfig.MinVersion = tls.VersionTLS13
 

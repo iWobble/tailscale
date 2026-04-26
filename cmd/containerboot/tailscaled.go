@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -33,13 +33,16 @@ func startTailscaled(ctx context.Context, cfg *settings) (*local.Client, *os.Pro
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
+	if cfg.CertShareMode != "" {
+		cmd.Env = append(os.Environ(), "TS_CERT_SHARE_MODE="+cfg.CertShareMode)
+	}
 	log.Printf("Starting tailscaled")
 	if err := cmd.Start(); err != nil {
-		return nil, nil, fmt.Errorf("starting tailscaled failed: %v", err)
+		return nil, nil, fmt.Errorf("starting tailscaled failed: %w", err)
 	}
 
 	// Wait for the socket file to appear, otherwise API ops will racily fail.
-	log.Printf("Waiting for tailscaled socket")
+	log.Printf("Waiting for tailscaled socket at %s", cfg.Socket)
 	for {
 		if ctx.Err() != nil {
 			return nil, nil, errors.New("timed out waiting for tailscaled socket")
@@ -66,7 +69,7 @@ func startTailscaled(ctx context.Context, cfg *settings) (*local.Client, *os.Pro
 func tailscaledArgs(cfg *settings) []string {
 	args := []string{"--socket=" + cfg.Socket}
 	switch {
-	case cfg.InKubernetes && cfg.KubeSecret != "":
+	case cfg.KubeSecret != "":
 		args = append(args, "--state=kube:"+cfg.KubeSecret)
 		if cfg.StateDir == "" {
 			cfg.StateDir = "/tmp"
@@ -116,6 +119,18 @@ func tailscaleUp(ctx context.Context, cfg *settings) error {
 	}
 	if cfg.AuthKey != "" {
 		args = append(args, "--authkey="+cfg.AuthKey)
+	}
+	if cfg.ClientID != "" {
+		args = append(args, "--client-id="+cfg.ClientID)
+	}
+	if cfg.ClientSecret != "" {
+		args = append(args, "--client-secret="+cfg.ClientSecret)
+	}
+	if cfg.IDToken != "" {
+		args = append(args, "--id-token="+cfg.IDToken)
+	}
+	if cfg.Audience != "" {
+		args = append(args, "--audience="+cfg.Audience)
 	}
 	// --advertise-routes can be passed an empty string to configure a
 	// device (that might have previously advertised subnet routes) to not
@@ -173,11 +188,14 @@ func tailscaleSet(ctx context.Context, cfg *settings) error {
 func watchTailscaledConfigChanges(ctx context.Context, path string, lc *local.Client, errCh chan<- error) {
 	var (
 		tickChan          <-chan time.Time
+		eventChan         <-chan fsnotify.Event
+		errChan           <-chan error
 		tailscaledCfgDir  = filepath.Dir(path)
 		prevTailscaledCfg []byte
 	)
-	w, err := fsnotify.NewWatcher()
-	if err != nil {
+	if w, err := fsnotify.NewWatcher(); err != nil {
+		// Creating a new fsnotify watcher would fail for example if inotify was not able to create a new file descriptor.
+		// See https://github.com/tailscale/tailscale/issues/15081
 		log.Printf("tailscaled config watch: failed to create fsnotify watcher, timer-only mode: %v", err)
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -188,6 +206,8 @@ func watchTailscaledConfigChanges(ctx context.Context, path string, lc *local.Cl
 			errCh <- fmt.Errorf("failed to add fsnotify watch: %w", err)
 			return
 		}
+		eventChan = w.Events
+		errChan = w.Errors
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -205,11 +225,11 @@ func watchTailscaledConfigChanges(ctx context.Context, path string, lc *local.Cl
 		select {
 		case <-ctx.Done():
 			return
-		case err := <-w.Errors:
+		case err := <-errChan:
 			errCh <- fmt.Errorf("watcher error: %w", err)
 			return
 		case <-tickChan:
-		case event := <-w.Events:
+		case event := <-eventChan:
 			if event.Name != toWatch {
 				continue
 			}

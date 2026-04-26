@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tailcfg_test
@@ -17,13 +17,12 @@ import (
 	"tailscale.com/tstest/deptest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := range t.NumField() {
-		fields = append(fields, t.Field(i).Name)
+	for field := range t.Fields() {
+		fields = append(fields, field.Name)
 	}
 	return
 }
@@ -67,7 +66,11 @@ func TestHostinfoEqual(t *testing.T) {
 		"UserspaceRouter",
 		"AppConnector",
 		"ServicesHash",
+		"PeerRelay",
+		"ExitNodeID",
 		"Location",
+		"TPM",
+		"StateEncrypted",
 	}
 	if have := fieldsOf(reflect.TypeFor[Hostinfo]()); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -242,6 +245,16 @@ func TestHostinfoEqual(t *testing.T) {
 			false,
 		},
 		{
+			&Hostinfo{PeerRelay: true},
+			&Hostinfo{PeerRelay: true},
+			true,
+		},
+		{
+			&Hostinfo{PeerRelay: true},
+			&Hostinfo{PeerRelay: false},
+			false,
+		},
+		{
 			&Hostinfo{ServicesHash: "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"},
 			&Hostinfo{ServicesHash: "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"},
 			true,
@@ -269,6 +282,21 @@ func TestHostinfoEqual(t *testing.T) {
 		{
 			&Hostinfo{IngressEnabled: false},
 			&Hostinfo{IngressEnabled: true},
+			false,
+		},
+		{
+			&Hostinfo{ExitNodeID: "stable-exit"},
+			&Hostinfo{ExitNodeID: "stable-exit"},
+			true,
+		},
+		{
+			&Hostinfo{ExitNodeID: ""},
+			&Hostinfo{},
+			true,
+		},
+		{
+			&Hostinfo{ExitNodeID: ""},
+			&Hostinfo{ExitNodeID: "stable-exit"},
 			false,
 		},
 	}
@@ -510,22 +538,22 @@ func TestNodeEqual(t *testing.T) {
 		},
 		{
 			&Node{},
-			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: new(netip.MustParseAddr("100.64.0.1"))},
 			false,
 		},
 		{
-			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
-			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: new(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: new(netip.MustParseAddr("100.64.0.1"))},
 			true,
 		},
 		{
 			&Node{},
-			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: new(netip.MustParseAddr("2001::3456"))},
 			false,
 		},
 		{
-			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
-			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: new(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: new(netip.MustParseAddr("2001::3456"))},
 			true,
 		},
 		{
@@ -589,7 +617,6 @@ func TestNodeEqual(t *testing.T) {
 func TestNetInfoFields(t *testing.T) {
 	handled := []string{
 		"MappingVariesByDestIP",
-		"HairPinning",
 		"WorkingIPv6",
 		"OSHasIPv6",
 		"WorkingUDP",
@@ -814,12 +841,12 @@ func TestMarshalToRawMessageAndBack(t *testing.T) {
 			capType: PeerCapability("foo"),
 		},
 		{
-			name:    "some values",
+			name:    "some-values",
 			val:     testRule{Ports: []int{80, 443}, Name: "foo"},
 			capType: PeerCapability("foo"),
 		},
 		{
-			name:    "all values",
+			name:    "all-values",
 			val:     testRule{Ports: []int{80, 443}, Name: "foo", ToggleOn: true, Groups: inner{Groups: []string{"foo", "bar"}}, Addrs: []netip.AddrPort{testip}},
 			capType: PeerCapability("foo"),
 		},
@@ -873,6 +900,135 @@ func TestCheckTag(t *testing.T) {
 				t.Errorf("got nil; want error")
 			} else if err != nil && tt.want {
 				t.Errorf("got %v; want nil", err)
+			}
+		})
+	}
+}
+
+func TestDisplayMessageEqual(t *testing.T) {
+	type test struct {
+		name      string
+		value1    DisplayMessage
+		value2    DisplayMessage
+		wantEqual bool
+	}
+
+	for _, test := range []test{
+		{
+			name: "same",
+			value1: DisplayMessage{
+				Title:               "title",
+				Text:                "text",
+				Severity:            SeverityHigh,
+				ImpactsConnectivity: false,
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			value2: DisplayMessage{
+				Title:               "title",
+				Text:                "text",
+				Severity:            SeverityHigh,
+				ImpactsConnectivity: false,
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			wantEqual: true,
+		},
+		{
+			name: "different-title",
+			value1: DisplayMessage{
+				Title: "title",
+			},
+			value2: DisplayMessage{
+				Title: "different title",
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-text",
+			value1: DisplayMessage{
+				Text: "some text",
+			},
+			value2: DisplayMessage{
+				Text: "different text",
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-severity",
+			value1: DisplayMessage{
+				Severity: SeverityHigh,
+			},
+			value2: DisplayMessage{
+				Severity: SeverityMedium,
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-impactsConnectivity",
+			value1: DisplayMessage{
+				ImpactsConnectivity: true,
+			},
+			value2: DisplayMessage{
+				ImpactsConnectivity: false,
+			},
+			wantEqual: false,
+		},
+		{
+			name:   "different-primaryAction-nil-non-nil",
+			value1: DisplayMessage{},
+			value2: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-primaryAction-url",
+			value1: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			value2: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://zombo.com",
+					Label: "Open",
+				},
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-primaryAction-label",
+			value1: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			value2: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Learn more",
+				},
+			},
+			wantEqual: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := test.value1.Equal(test.value2)
+
+			if got != test.wantEqual {
+				value1 := must.Get(json.MarshalIndent(test.value1, "", "  "))
+				value2 := must.Get(json.MarshalIndent(test.value2, "", "  "))
+				t.Errorf("value1.Equal(value2): got %t, want %t\nvalue1:\n%s\nvalue2:\n%s", got, test.wantEqual, value1, value2)
 			}
 		})
 	}

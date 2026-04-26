@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnauth
@@ -8,8 +8,11 @@ import (
 	"fmt"
 
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
-	"tailscale.com/util/syspolicy"
+	"tailscale.com/tailcfg"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
 )
 
 type actorWithPolicyChecks struct{ Actor }
@@ -48,25 +51,29 @@ func (a actorWithPolicyChecks) CheckProfileAccess(profile ipn.LoginProfileView, 
 //
 // TODO(nickkhyl): unexport it when we move [ipn.Actor] implementations from [ipnserver]
 // and corp to this package.
-func CheckDisconnectPolicy(actor Actor, profile ipn.LoginProfileView, reason string, auditLogger AuditLogFunc) error {
-	if alwaysOn, _ := syspolicy.GetBoolean(syspolicy.AlwaysOn, false); !alwaysOn {
+func CheckDisconnectPolicy(actor Actor, profile ipn.LoginProfileView, reason string, auditFn AuditLogFunc) error {
+	if !buildfeatures.HasSystemPolicy {
 		return nil
 	}
-	if allowWithReason, _ := syspolicy.GetBoolean(syspolicy.AlwaysOnOverrideWithReason, false); !allowWithReason {
+	if alwaysOn, _ := policyclient.Get().GetBoolean(pkey.AlwaysOn, false); !alwaysOn {
+		return nil
+	}
+	if allowWithReason, _ := policyclient.Get().GetBoolean(pkey.AlwaysOnOverrideWithReason, false); !allowWithReason {
 		return errors.New("disconnect not allowed: always-on mode is enabled")
 	}
 	if reason == "" {
 		return errors.New("disconnect not allowed: reason required")
 	}
-	if auditLogger != nil {
+	if auditFn != nil {
 		var details string
 		if username, _ := actor.Username(); username != "" { // best-effort; we don't have it on all platforms
 			details = fmt.Sprintf("%q is being disconnected by %q: %v", profile.Name(), username, reason)
 		} else {
 			details = fmt.Sprintf("%q is being disconnected: %v", profile.Name(), reason)
 		}
-		// TODO(nickkhyl,barnstar): use a const for DISCONNECT_NODE.
-		auditLogger("DISCONNECT_NODE", details)
+		if err := auditFn(tailcfg.AuditNodeDisconnect, details); err != nil {
+			return err
+		}
 	}
 	return nil
 }

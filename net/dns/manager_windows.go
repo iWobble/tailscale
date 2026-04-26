@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package dns
@@ -16,7 +16,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -27,9 +26,15 @@ import (
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/eventbus"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
+	"tailscale.com/util/syspolicy/ptype"
 	"tailscale.com/util/winutil"
+	"tailscale.com/util/winutil/winenv"
 )
 
 const (
@@ -44,24 +49,36 @@ type windowsManager struct {
 	knobs      *controlknobs.Knobs // or nil
 	nrptDB     *nrptRuleDatabase
 	wslManager *wslManager
+	polc       policyclient.Client
 
-	mu      sync.Mutex
+	unregisterPolicyChangeCb func() // called when the manager is closing
+
+	mu      syncs.Mutex
 	closing bool
 }
 
 // NewOSConfigurator created a new OS configurator.
 //
-// The health tracker and the knobs may be nil.
-func NewOSConfigurator(logf logger.Logf, health *health.Tracker, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+// The health tracker, eventbus and the knobs may be nil.
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, bus *eventbus.Bus, polc policyclient.Client, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+	if polc == nil {
+		panic("nil policyclient.Client")
+	}
 	ret := &windowsManager{
 		logf:       logf,
 		guid:       interfaceName,
 		knobs:      knobs,
+		polc:       polc,
 		wslManager: newWSLManager(logf, health),
 	}
 
 	if isWindows10OrBetter() {
 		ret.nrptDB = newNRPTRuleDatabase(logf)
+	}
+
+	var err error
+	if ret.unregisterPolicyChangeCb, err = polc.RegisterChangeCallback(ret.sysPolicyChanged); err != nil {
+		logf("error registering policy change callback: %v", err) // non-fatal
 	}
 
 	go func() {
@@ -148,7 +165,7 @@ func setTailscaleHosts(logf logger.Logf, prevHostsFile []byte, hosts []*HostEntr
 		header = "# TailscaleHostsSectionStart"
 		footer = "# TailscaleHostsSectionEnd"
 	)
-	var comments = []string{
+	comments := []string{
 		"# This section contains MagicDNS entries for Tailscale.",
 		"# Do not edit this section manually.",
 	}
@@ -338,6 +355,10 @@ func (m *windowsManager) disableLocalDNSOverrideViaNRPT() bool {
 	return m.knobs != nil && m.knobs.DisableLocalDNSOverrideViaNRPT.Load()
 }
 
+func (m *windowsManager) disableHostsFileUpdates() bool {
+	return m.knobs != nil && m.knobs.DisableHostsFileUpdates.Load()
+}
+
 func (m *windowsManager) SetDNS(cfg OSConfig) error {
 	// We can configure Windows DNS in one of two ways:
 	//
@@ -362,11 +383,9 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 	// configuration only, routing one set of things to the "split"
 	// resolver and the rest to the primary.
 
-	// Unconditionally disable dynamic DNS updates and NetBIOS on our
-	// interfaces.
-	if err := m.disableDynamicUpdates(); err != nil {
-		m.logf("disableDynamicUpdates error: %v\n", err)
-	}
+	// Reconfigure DNS registration according to the [syspolicy.DNSRegistration]
+	// policy setting, and unconditionally disable NetBIOS on our interfaces.
+	m.reconfigureDNSRegistration()
 	if err := m.disableNetBIOS(); err != nil {
 		m.logf("disableNetBIOS error: %v\n", err)
 	}
@@ -385,7 +404,15 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 		if err := m.setSplitDNS(resolvers, domains); err != nil {
 			return err
 		}
-		if err := m.setHosts(nil); err != nil {
+		var hosts []*HostEntry
+		if !m.disableHostsFileUpdates() && winenv.IsDomainJoined() {
+			// On domain-joined Windows devices the primary search domain (the one the device is joined to)
+			// always takes precedence over other search domains. This breaks MagicDNS when we are the primary
+			// resolver on the device (see #18712). To work around this Windows behavior, we should write MagicDNS
+			// host names the hosts file just as we do when we're not the primary resolver.
+			hosts = cfg.Hosts
+		}
+		if err := m.setHosts(hosts); err != nil {
 			return err
 		}
 		if err := m.setPrimaryDNS(cfg.Nameservers, cfg.SearchDomains); err != nil {
@@ -407,12 +434,14 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 			return err
 		}
 
-		// As we are not the primary resolver in this setup, we need to
-		// explicitly set some single name hosts to ensure that we can resolve
-		// them quickly and get around the 2.3s delay that otherwise occurs due
-		// to multicast timeouts.
-		if err := m.setHosts(cfg.Hosts); err != nil {
-			return err
+		if !m.disableHostsFileUpdates() {
+			// As we are not the primary resolver in this setup, we need to
+			// explicitly set some single name hosts to ensure that we can resolve
+			// them quickly and get around the 2.3s delay that otherwise occurs due
+			// to multicast timeouts.
+			if err := m.setHosts(cfg.Hosts); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -485,6 +514,10 @@ func (m *windowsManager) Close() error {
 	m.closing = true
 	m.mu.Unlock()
 
+	if m.unregisterPolicyChangeCb != nil {
+		m.unregisterPolicyChangeCb()
+	}
+
 	err := m.SetDNS(OSConfig{})
 	if m.nrptDB != nil {
 		m.nrptDB.Close()
@@ -493,13 +526,60 @@ func (m *windowsManager) Close() error {
 	return err
 }
 
-// disableDynamicUpdates sets the appropriate registry values to prevent the
-// Windows DHCP client from sending dynamic DNS updates for our interface to
-// AD domain controllers.
-func (m *windowsManager) disableDynamicUpdates() error {
+// sysPolicyChanged is a callback triggered by [syspolicy] when it detects
+// a change in one or more syspolicy settings.
+func (m *windowsManager) sysPolicyChanged(policy policyclient.PolicyChange) {
+	if policy.HasChanged(pkey.EnableDNSRegistration) {
+		m.reconfigureDNSRegistration()
+	}
+}
+
+// reconfigureDNSRegistration configures the DNS registration settings
+// using the [syspolicy.DNSRegistration] policy setting, if it is set.
+// If the policy is not configured, it disables DNS registration.
+func (m *windowsManager) reconfigureDNSRegistration() {
+	// Disable DNS registration by default (if the policy setting is not configured).
+	// This is primarily for historical reasons and to avoid breaking existing
+	// setups that rely on this behavior.
+	enableDNSRegistration, err := m.polc.GetPreferenceOption(pkey.EnableDNSRegistration, ptype.NeverByPolicy)
+	if err != nil {
+		m.logf("error getting DNSRegistration policy setting: %v", err) // non-fatal; we'll use the default
+	}
+
+	if enableDNSRegistration.Show() {
+		// "Show" reports whether the policy setting is configured as "user-decides".
+		// The name is a bit unfortunate in this context, as we don't actually "show" anything.
+		// Still, if the admin configured the policy as "user-decides", we shouldn't modify
+		// the adapter's settings and should leave them up to the user (admin rights required)
+		// or the system defaults.
+		return
+	}
+
+	// Otherwise, if the policy setting is configured as "always" or "never",
+	// we should configure the adapter accordingly.
+	if err := m.configureDNSRegistration(enableDNSRegistration.IsAlways()); err != nil {
+		m.logf("error configuring DNS registration: %v", err)
+	}
+}
+
+// configureDNSRegistration sets the appropriate registry values to allow or prevent
+// the Windows DHCP client from registering Tailscale IP addresses with DNS
+// and sending dynamic updates for our interface to AD domain controllers.
+func (m *windowsManager) configureDNSRegistration(enabled bool) error {
 	prefixen := []winutil.RegistryPathPrefix{
 		winutil.IPv4TCPIPInterfacePrefix,
 		winutil.IPv6TCPIPInterfacePrefix,
+	}
+
+	var (
+		registrationEnabled            = uint32(0)
+		disableDynamicUpdate           = uint32(1)
+		maxNumberOfAddressesToRegister = uint32(0)
+	)
+	if enabled {
+		registrationEnabled = 1
+		disableDynamicUpdate = 0
+		maxNumberOfAddressesToRegister = 1
 	}
 
 	for _, prefix := range prefixen {
@@ -509,13 +589,13 @@ func (m *windowsManager) disableDynamicUpdates() error {
 		}
 		defer k.Close()
 
-		if err := k.SetDWordValue("RegistrationEnabled", 0); err != nil {
+		if err := k.SetDWordValue("RegistrationEnabled", registrationEnabled); err != nil {
 			return err
 		}
-		if err := k.SetDWordValue("DisableDynamicUpdate", 1); err != nil {
+		if err := k.SetDWordValue("DisableDynamicUpdate", disableDynamicUpdate); err != nil {
 			return err
 		}
-		if err := k.SetDWordValue("MaxNumberOfAddressesToRegister", 0); err != nil {
+		if err := k.SetDWordValue("MaxNumberOfAddressesToRegister", maxNumberOfAddressesToRegister); err != nil {
 			return err
 		}
 	}

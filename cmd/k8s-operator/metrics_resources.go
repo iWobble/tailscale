@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
 
 	"go.uber.org/zap"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
 )
 
 const (
@@ -222,7 +224,7 @@ func metricsResourceName(stsName string) string {
 // proxy.
 func metricsResourceLabels(opts *metricsOpts) map[string]string {
 	lbls := map[string]string{
-		LabelManaged:             "true",
+		kubetypes.LabelManaged:   "true",
 		labelMetricsTarget:       opts.proxyStsName,
 		labelPromProxyType:       opts.proxyType,
 		labelPromProxyParentName: opts.proxyLabels[LabelParentName],
@@ -285,11 +287,7 @@ func isNamespacedProxyType(typ string) bool {
 
 func mergeMapKeys(a, b map[string]string) map[string]string {
 	m := make(map[string]string, len(a)+len(b))
-	for key, val := range b {
-		m[key] = val
-	}
-	for key, val := range a {
-		m[key] = val
-	}
+	maps.Copy(m, b)
+	maps.Copy(m, a)
 	return m
 }

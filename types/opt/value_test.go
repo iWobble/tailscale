@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package opt
@@ -11,6 +11,11 @@ import (
 	jsonv2 "github.com/go-json-experiment/json"
 	"tailscale.com/types/bools"
 	"tailscale.com/util/must"
+)
+
+var (
+	_ jsonv2.MarshalerTo     = (*Value[bool])(nil)
+	_ jsonv2.UnmarshalerFrom = (*Value[bool])(nil)
 )
 
 type testStruct struct {

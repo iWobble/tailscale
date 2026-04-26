@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The stund binary is a standalone STUN server.
@@ -15,6 +15,9 @@ import (
 
 	"tailscale.com/net/stunserver"
 	"tailscale.com/tsweb"
+
+	// Support for prometheus varz in tsweb
+	_ "tailscale.com/tsweb/promvarz"
 )
 
 var (

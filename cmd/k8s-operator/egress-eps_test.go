@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -11,7 +11,6 @@ import (
 	"math/rand/v2"
 	"testing"
 
-	"github.com/AlekSi/pointer"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -20,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/egressservices"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tstest"
 	"tailscale.com/util/mak"
 )
@@ -105,11 +105,11 @@ func TestTailscaleEgressEndpointSlices(t *testing.T) {
 		expectReconciled(t, er, "operator-ns", "foo")
 		eps.Endpoints = append(eps.Endpoints, discoveryv1.Endpoint{
 			Addresses: []string{"10.0.0.1"},
-			Hostname:  pointer.To("foo"),
+			Hostname:  new("foo"),
 			Conditions: discoveryv1.EndpointConditions{
-				Serving:     pointer.ToBool(true),
-				Ready:       pointer.ToBool(true),
-				Terminating: pointer.ToBool(false),
+				Serving:     new(true),
+				Ready:       new(true),
+				Terminating: new(false),
 			},
 		})
 		expectEqual(t, fc, eps)
@@ -200,7 +200,7 @@ func podAndSecretForProxyGroup(pg string) (*corev1.Pod, *corev1.Secret) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-0", pg),
 			Namespace: "operator-ns",
-			Labels:    pgSecretLabels(pg, "state"),
+			Labels:    pgSecretLabels(pg, kubetypes.LabelSecretTypeState),
 		},
 	}
 	return p, s

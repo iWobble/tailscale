@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Command xdpderper runs the XDP STUN server.
@@ -18,6 +18,9 @@ import (
 	"tailscale.com/derp/xdp"
 	"tailscale.com/net/netutil"
 	"tailscale.com/tsweb"
+
+	// Support for prometheus varz in tsweb
+	_ "tailscale.com/tsweb/promvarz"
 )
 
 var (

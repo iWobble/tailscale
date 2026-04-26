@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netcheck
@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/derp"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
@@ -41,8 +42,7 @@ func TestBasic(t *testing.T) {
 
 	c := newTestClient(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	if err := c.Standalone(ctx, "127.0.0.1:0"); err != nil {
 		t.Fatal(err)
@@ -123,8 +123,7 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 
 	c := newTestClient(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	r, err := c.GetReport(ctx, dm, nil)
 	if err != nil {
@@ -419,6 +418,39 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 			wantPrevLen: 2,
 			wantDERP:    1,
 		},
+		{
+			name: "no_data_keep_home",
+			steps: []step{
+				{0, report("d1", 2, "d2", 3)},
+				{30 * time.Second, report()},
+				{2 * time.Second, report()},
+				{2 * time.Second, report()},
+				{2 * time.Second, report()},
+				{2 * time.Second, report()},
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
+					1: startTime,
+				}),
+			},
+			wantPrevLen: 6,
+			wantDERP:    1,
+		},
+		{
+			name: "no_data_home_expires",
+			steps: []step{
+				{0, report("d1", 2, "d2", 3)},
+				{30 * time.Second, report()},
+				{2 * derp.KeepAlive, report()},
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
+					1: startTime,
+				}),
+			},
+			wantPrevLen: 3,
+			wantDERP:    0,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -455,7 +487,7 @@ func TestMakeProbePlan(t *testing.T) {
 	basicMap := &tailcfg.DERPMap{
 		Regions: map[int]*tailcfg.DERPRegion{},
 	}
-	for rid := 1; rid <= 5; rid++ {
+	for rid := 1; rid <= 6; rid++ {
 		var nodes []*tailcfg.DERPNode
 		for nid := 0; nid < rid; nid++ {
 			nodes = append(nodes, &tailcfg.DERPNode{
@@ -467,8 +499,9 @@ func TestMakeProbePlan(t *testing.T) {
 			})
 		}
 		basicMap.Regions[rid] = &tailcfg.DERPRegion{
-			RegionID: rid,
-			Nodes:    nodes,
+			RegionID:        rid,
+			Nodes:           nodes,
+			NoMeasureNoHome: rid == 6,
 		}
 	}
 
@@ -965,7 +998,7 @@ func TestNodeAddrResolve(t *testing.T) {
 				}
 				t.Logf("got IPv6 addr: %v", ap)
 			})
-			t.Run("IPv6 Failure", func(t *testing.T) {
+			t.Run("IPv6-Failure", func(t *testing.T) {
 				ap, ok := c.nodeAddrPort(ctx, dnV4Only, dn.STUNPort, probeIPv6)
 				if ok {
 					t.Fatalf("expected no addr but got: %v", ap)
@@ -1003,8 +1036,7 @@ func TestNoUDPNilGetReportOpts(t *testing.T) {
 	}
 
 	c := newTestClient(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	r, err := c.GetReport(ctx, dm, nil)
 	if err != nil {

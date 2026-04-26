@@ -1,21 +1,20 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
-
-//go:build go1.22
 
 // Package local contains a Go client for the Tailscale LocalAPI.
 package local
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -28,21 +27,24 @@ import (
 	"sync"
 	"time"
 
-	"go4.org/mem"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/drive"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netutil"
+	"tailscale.com/net/udprelay/status"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tka"
+	"tailscale.com/types/appctype"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
-	"tailscale.com/types/tkatype"
-	"tailscale.com/util/syspolicy/setting"
+	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/eventbus"
 )
 
 // defaultClient is the default Client when using the legacy
@@ -190,8 +192,8 @@ func (e *AccessDeniedError) Unwrap() error { return e.err }
 
 // IsAccessDeniedError reports whether err is or wraps an AccessDeniedError.
 func IsAccessDeniedError(err error) bool {
-	var ae *AccessDeniedError
-	return errors.As(err, &ae)
+	_, ok := errors.AsType[*AccessDeniedError](err)
+	return ok
 }
 
 // PreconditionsFailedError is returned when the server responds
@@ -208,8 +210,8 @@ func (e *PreconditionsFailedError) Unwrap() error { return e.err }
 
 // IsPreconditionsFailedError reports whether err is or wraps an PreconditionsFailedError.
 func IsPreconditionsFailedError(err error) bool {
-	var ae *PreconditionsFailedError
-	return errors.As(err, &ae)
+	_, ok := errors.AsType[*PreconditionsFailedError](err)
+	return ok
 }
 
 // bestError returns either err, or if body contains a valid JSON
@@ -294,7 +296,7 @@ func (lc *Client) get200(ctx context.Context, path string) ([]byte, error) {
 
 // WhoIs returns the owner of the remoteAddr, which must be an IP or IP:port.
 //
-// Deprecated: use Client.WhoIs.
+// Deprecated: use [Client.WhoIs].
 func WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
 	return defaultClient.WhoIs(ctx, remoteAddr)
 }
@@ -309,7 +311,7 @@ func decodeJSON[T any](b []byte) (ret T, err error) {
 
 // WhoIs returns the owner of the remoteAddr, which must be an IP or IP:port.
 //
-// If not found, the error is ErrPeerNotFound.
+// If not found, the error is [ErrPeerNotFound].
 //
 // For connections proxied by tailscaled, this looks up the owner of the given
 // address as TCP first, falling back to UDP; if you want to only check a
@@ -325,7 +327,8 @@ func (lc *Client) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsR
 	return decodeJSON[*apitype.WhoIsResponse](body)
 }
 
-// ErrPeerNotFound is returned by WhoIs and WhoIsNodeKey when a peer is not found.
+// ErrPeerNotFound is returned by [Client.WhoIs], [Client.WhoIsNodeKey] and
+// [Client.WhoIsProto] when a peer is not found.
 var ErrPeerNotFound = errors.New("peer not found")
 
 // WhoIsNodeKey returns the owner of the given wireguard public key.
@@ -345,7 +348,7 @@ func (lc *Client) WhoIsNodeKey(ctx context.Context, key key.NodePublic) (*apityp
 // WhoIsProto returns the owner of the remoteAddr, which must be an IP or
 // IP:port, for the given protocol (tcp or udp).
 //
-// If not found, the error is ErrPeerNotFound.
+// If not found, the error is [ErrPeerNotFound].
 func (lc *Client) WhoIsProto(ctx context.Context, proto, remoteAddr string) (*apitype.WhoIsResponse, error) {
 	body, err := lc.get200(ctx, "/localapi/v0/whois?proto="+url.QueryEscape(proto)+"&addr="+url.QueryEscape(remoteAddr))
 	if err != nil {
@@ -380,18 +383,42 @@ func (lc *Client) UserMetrics(ctx context.Context) ([]byte, error) {
 //
 // IncrementCounter does not support gauge metrics or negative delta values.
 func (lc *Client) IncrementCounter(ctx context.Context, name string, delta int) error {
-	type metricUpdate struct {
-		Name  string `json:"name"`
-		Type  string `json:"type"`
-		Value int    `json:"value"` // amount to increment by
+	if !buildfeatures.HasClientMetrics {
+		return nil
 	}
 	if delta < 0 {
 		return errors.New("negative delta not allowed")
 	}
-	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]metricUpdate{{
+	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]clientmetric.MetricUpdate{{
 		Name:  name,
 		Type:  "counter",
 		Value: delta,
+		Op:    "add",
+	}}))
+	return err
+}
+
+// IncrementGauge increments the value of a Tailscale daemon's gauge
+// metric by the given delta. If the metric has yet to exist, a new gauge
+// metric is created and initialized to delta. The delta value can be negative.
+func (lc *Client) IncrementGauge(ctx context.Context, name string, delta int) error {
+	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]clientmetric.MetricUpdate{{
+		Name:  name,
+		Type:  "gauge",
+		Value: delta,
+		Op:    "add",
+	}}))
+	return err
+}
+
+// SetGauge sets the value of a Tailscale daemon's gauge metric to the given value.
+// If the metric has yet to exist, a new gauge metric is created and initialized to value.
+func (lc *Client) SetGauge(ctx context.Context, name string, value int) error {
+	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]clientmetric.MetricUpdate{{
+		Name:  name,
+		Type:  "gauge",
+		Value: value,
+		Op:    "set",
 	}}))
 	return err
 }
@@ -411,6 +438,55 @@ func (lc *Client) TailDaemonLogs(ctx context.Context) (io.Reader, error) {
 		return nil, errors.New(res.Status)
 	}
 	return res.Body, nil
+}
+
+// EventBusGraph returns a graph of active publishers and subscribers in the eventbus
+// as a [eventbus.DebugTopics]
+func (lc *Client) EventBusGraph(ctx context.Context) ([]byte, error) {
+	return lc.get200(ctx, "/localapi/v0/debug-bus-graph")
+}
+
+// EventBusQueues returns a JSON snapshot of event bus queue depths per client.
+func (lc *Client) EventBusQueues(ctx context.Context) ([]byte, error) {
+	return lc.get200(ctx, "/localapi/v0/debug-bus-queues")
+}
+
+// StreamBusEvents returns an iterator of Tailscale bus events as they arrive.
+// Each pair is a valid event and a nil error, or a zero event a non-nil error.
+// In case of error, the iterator ends after the pair reporting the error.
+// Iteration stops if ctx ends.
+func (lc *Client) StreamBusEvents(ctx context.Context) iter.Seq2[eventbus.DebugEvent, error] {
+	return func(yield func(eventbus.DebugEvent, error) bool) {
+		req, err := http.NewRequestWithContext(ctx, "GET",
+			"http://"+apitype.LocalAPIHost+"/localapi/v0/debug-bus-events", nil)
+		if err != nil {
+			yield(eventbus.DebugEvent{}, err)
+			return
+		}
+		res, err := lc.doLocalRequestNiceError(req)
+		if err != nil {
+			yield(eventbus.DebugEvent{}, err)
+			return
+		}
+		if res.StatusCode != http.StatusOK {
+			yield(eventbus.DebugEvent{}, errors.New(res.Status))
+			return
+		}
+		defer res.Body.Close()
+		dec := json.NewDecoder(bufio.NewReader(res.Body))
+		for {
+			var evt eventbus.DebugEvent
+			if err := dec.Decode(&evt); err == io.EOF {
+				return
+			} else if err != nil {
+				yield(eventbus.DebugEvent{}, err)
+				return
+			}
+			if !yield(evt, nil) {
+				return
+			}
+		}
+	}
 }
 
 // Pprof returns a pprof profile of the Tailscale daemon.
@@ -490,7 +566,7 @@ func (lc *Client) BugReportWithOpts(ctx context.Context, opts BugReportOpts) (st
 
 // BugReport logs and returns a log marker that can be shared by the user with support.
 //
-// This is the same as calling BugReportWithOpts and only specifying the Note
+// This is the same as calling [Client.BugReportWithOpts] and only specifying the Note
 // field.
 func (lc *Client) BugReport(ctx context.Context, note string) (string, error) {
 	return lc.BugReportWithOpts(ctx, BugReportOpts{Note: note})
@@ -531,68 +607,17 @@ func (lc *Client) DebugResultJSON(ctx context.Context, action string) (any, erro
 	return x, nil
 }
 
-// DebugPortmapOpts contains options for the DebugPortmap command.
-type DebugPortmapOpts struct {
-	// Duration is how long the mapping should be created for. It defaults
-	// to 5 seconds if not set.
-	Duration time.Duration
-
-	// Type is the kind of portmap to debug. The empty string instructs the
-	// portmap client to perform all known types. Other valid options are
-	// "pmp", "pcp", and "upnp".
-	Type string
-
-	// GatewayAddr specifies the gateway address used during portmapping.
-	// If set, SelfAddr must also be set. If unset, it will be
-	// autodetected.
-	GatewayAddr netip.Addr
-
-	// SelfAddr specifies the gateway address used during portmapping. If
-	// set, GatewayAddr must also be set. If unset, it will be
-	// autodetected.
-	SelfAddr netip.Addr
-
-	// LogHTTP instructs the debug-portmap endpoint to print all HTTP
-	// requests and responses made to the logs.
-	LogHTTP bool
-}
-
-// DebugPortmap invokes the debug-portmap endpoint, and returns an
-// io.ReadCloser that can be used to read the logs that are printed during this
-// process.
-//
-// opts can be nil; if so, default values will be used.
-func (lc *Client) DebugPortmap(ctx context.Context, opts *DebugPortmapOpts) (io.ReadCloser, error) {
-	vals := make(url.Values)
-	if opts == nil {
-		opts = &DebugPortmapOpts{}
-	}
-
-	vals.Set("duration", cmp.Or(opts.Duration, 5*time.Second).String())
-	vals.Set("type", opts.Type)
-	vals.Set("log_http", strconv.FormatBool(opts.LogHTTP))
-
-	if opts.GatewayAddr.IsValid() != opts.SelfAddr.IsValid() {
-		return nil, fmt.Errorf("both GatewayAddr and SelfAddr must be provided if one is")
-	} else if opts.GatewayAddr.IsValid() {
-		vals.Set("gateway_and_self", fmt.Sprintf("%s/%s", opts.GatewayAddr, opts.SelfAddr))
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://"+apitype.LocalAPIHost+"/localapi/v0/debug-portmap?"+vals.Encode(), nil)
+// QueryOptionalFeatures queries the optional features supported by the Tailscale daemon.
+func (lc *Client) QueryOptionalFeatures(ctx context.Context) (*apitype.OptionalFeatures, error) {
+	body, err := lc.send(ctx, "POST", "/localapi/v0/debug-optional-features", 200, nil)
 	if err != nil {
+		return nil, fmt.Errorf("error %w: %s", err, body)
+	}
+	var x apitype.OptionalFeatures
+	if err := json.Unmarshal(body, &x); err != nil {
 		return nil, err
 	}
-	res, err := lc.doLocalRequestNiceError(req)
-	if err != nil {
-		return nil, err
-	}
-	if res.StatusCode != 200 {
-		body, _ := io.ReadAll(res.Body)
-		res.Body.Close()
-		return nil, fmt.Errorf("HTTP %s: %s", res.Status, body)
-	}
-
-	return res.Body, nil
+	return &x, nil
 }
 
 // SetDevStoreKeyValue set a statestore key/value. It's only meant for development.
@@ -612,6 +637,9 @@ func (lc *Client) SetDevStoreKeyValue(ctx context.Context, key, value string) er
 // the provided duration. If the duration is in the past, the debug logging
 // is disabled.
 func (lc *Client) SetComponentDebugLogging(ctx context.Context, component string, d time.Duration) error {
+	if !buildfeatures.HasDebug {
+		return feature.ErrUnavailable
+	}
 	body, err := lc.send(ctx, "POST",
 		fmt.Sprintf("/localapi/v0/component-debug-logging?component=%s&secs=%d",
 			url.QueryEscape(component), int64(d.Seconds())), 200, nil)
@@ -677,7 +705,7 @@ func (lc *Client) WaitingFiles(ctx context.Context) ([]apitype.WaitingFile, erro
 	return lc.AwaitWaitingFiles(ctx, 0)
 }
 
-// AwaitWaitingFiles is like WaitingFiles but takes a duration to await for an answer.
+// AwaitWaitingFiles is like [Client.WaitingFiles] but takes a duration to await for an answer.
 // If the duration is 0, it will return immediately. The duration is respected at second
 // granularity only. If no files are available, it returns (nil, nil).
 func (lc *Client) AwaitWaitingFiles(ctx context.Context, d time.Duration) ([]apitype.WaitingFile, error) {
@@ -751,6 +779,9 @@ func (lc *Client) PushFile(ctx context.Context, target tailcfg.StableNodeID, siz
 // machine is properly configured to forward IP packets as a subnet router
 // or exit node.
 func (lc *Client) CheckIPForwarding(ctx context.Context) error {
+	if !buildfeatures.HasAdvertiseRoutes {
+		return nil
+	}
 	body, err := lc.get200(ctx, "/localapi/v0/check-ip-forwarding")
 	if err != nil {
 		return err
@@ -844,36 +875,12 @@ func (lc *Client) EditPrefs(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn.Pref
 	return decodeJSON[*ipn.Prefs](body)
 }
 
-// GetEffectivePolicy returns the effective policy for the specified scope.
-func (lc *Client) GetEffectivePolicy(ctx context.Context, scope setting.PolicyScope) (*setting.Snapshot, error) {
-	scopeID, err := scope.MarshalText()
-	if err != nil {
-		return nil, err
-	}
-	body, err := lc.get200(ctx, "/localapi/v0/policy/"+string(scopeID))
-	if err != nil {
-		return nil, err
-	}
-	return decodeJSON[*setting.Snapshot](body)
-}
-
-// ReloadEffectivePolicy reloads the effective policy for the specified scope
-// by reading and merging policy settings from all applicable policy sources.
-func (lc *Client) ReloadEffectivePolicy(ctx context.Context, scope setting.PolicyScope) (*setting.Snapshot, error) {
-	scopeID, err := scope.MarshalText()
-	if err != nil {
-		return nil, err
-	}
-	body, err := lc.send(ctx, "POST", "/localapi/v0/policy/"+string(scopeID), 200, http.NoBody)
-	if err != nil {
-		return nil, err
-	}
-	return decodeJSON[*setting.Snapshot](body)
-}
-
 // GetDNSOSConfig returns the system DNS configuration for the current device.
 // That is, it returns the DNS configuration that the system would use if Tailscale weren't being used.
 func (lc *Client) GetDNSOSConfig(ctx context.Context) (*apitype.DNSOSConfig, error) {
+	if !buildfeatures.HasDNS {
+		return nil, feature.ErrUnavailable
+	}
 	body, err := lc.get200(ctx, "/localapi/v0/dns-osconfig")
 	if err != nil {
 		return nil, err
@@ -889,6 +896,9 @@ func (lc *Client) GetDNSOSConfig(ctx context.Context) (*apitype.DNSOSConfig, err
 // It returns the raw DNS response bytes and the resolvers that were used to answer the query
 // (often just one, but can be more if we raced multiple resolvers).
 func (lc *Client) QueryDNS(ctx context.Context, name string, queryType string) (bytes []byte, resolvers []*dnstype.Resolver, err error) {
+	if !buildfeatures.HasDNS {
+		return nil, nil, feature.ErrUnavailable
+	}
 	body, err := lc.get200(ctx, fmt.Sprintf("/localapi/v0/dns-query?name=%s&type=%s", url.QueryEscape(name), queryType))
 	if err != nil {
 		return nil, nil, err
@@ -919,34 +929,12 @@ func (lc *Client) Logout(ctx context.Context) error {
 	return err
 }
 
-// SetDNS adds a DNS TXT record for the given domain name, containing
-// the provided TXT value. The intended use case is answering
-// LetsEncrypt/ACME dns-01 challenges.
-//
-// The control plane will only permit SetDNS requests with very
-// specific names and values. The name should be
-// "_acme-challenge." + your node's MagicDNS name. It's expected that
-// clients cache the certs from LetsEncrypt (or whichever CA is
-// providing them) and only request new ones as needed; the control plane
-// rate limits SetDNS requests.
-//
-// This is a low-level interface; it's expected that most Tailscale
-// users use a higher level interface to getting/using TLS
-// certificates.
-func (lc *Client) SetDNS(ctx context.Context, name, value string) error {
-	v := url.Values{}
-	v.Set("name", name)
-	v.Set("value", value)
-	_, err := lc.send(ctx, "POST", "/localapi/v0/set-dns?"+v.Encode(), 200, nil)
-	return err
-}
-
 // DialTCP connects to the host's port via Tailscale.
 //
 // The host may be a base DNS name (resolved from the netmap inside
 // tailscaled), a FQDN, or an IP address.
 //
-// The ctx is only used for the duration of the call, not the lifetime of the net.Conn.
+// The ctx is only used for the duration of the call, not the lifetime of the [net.Conn].
 func (lc *Client) DialTCP(ctx context.Context, host string, port uint16) (net.Conn, error) {
 	return lc.UserDial(ctx, "tcp", host, port)
 }
@@ -957,7 +945,7 @@ func (lc *Client) DialTCP(ctx context.Context, host string, port uint16) (net.Co
 // a FQDN, or an IP address.
 //
 // The ctx is only used for the duration of the call, not the lifetime of the
-// net.Conn.
+// [net.Conn].
 func (lc *Client) UserDial(ctx context.Context, network, host string, port uint16) (net.Conn, error) {
 	connCh := make(chan net.Conn, 1)
 	trace := httptrace.ClientTrace{
@@ -1021,117 +1009,6 @@ func (lc *Client) CurrentDERPMap(ctx context.Context) (*tailcfg.DERPMap, error) 
 	return &derpMap, nil
 }
 
-// CertPair returns a cert and private key for the provided DNS domain.
-//
-// It returns a cached certificate from disk if it's still valid.
-//
-// Deprecated: use Client.CertPair.
-func CertPair(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error) {
-	return defaultClient.CertPair(ctx, domain)
-}
-
-// CertPair returns a cert and private key for the provided DNS domain.
-//
-// It returns a cached certificate from disk if it's still valid.
-//
-// API maturity: this is considered a stable API.
-func (lc *Client) CertPair(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error) {
-	return lc.CertPairWithValidity(ctx, domain, 0)
-}
-
-// CertPairWithValidity returns a cert and private key for the provided DNS
-// domain.
-//
-// It returns a cached certificate from disk if it's still valid.
-// When minValidity is non-zero, the returned certificate will be valid for at
-// least the given duration, if permitted by the CA. If the certificate is
-// valid, but for less than minValidity, it will be synchronously renewed.
-//
-// API maturity: this is considered a stable API.
-func (lc *Client) CertPairWithValidity(ctx context.Context, domain string, minValidity time.Duration) (certPEM, keyPEM []byte, err error) {
-	res, err := lc.send(ctx, "GET", fmt.Sprintf("/localapi/v0/cert/%s?type=pair&min_validity=%s", domain, minValidity), 200, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	// with ?type=pair, the response PEM is first the one private
-	// key PEM block, then the cert PEM blocks.
-	i := mem.Index(mem.B(res), mem.S("--\n--"))
-	if i == -1 {
-		return nil, nil, fmt.Errorf("unexpected output: no delimiter")
-	}
-	i += len("--\n")
-	keyPEM, certPEM = res[:i], res[i:]
-	if mem.Contains(mem.B(certPEM), mem.S(" PRIVATE KEY-----")) {
-		return nil, nil, fmt.Errorf("unexpected output: key in cert")
-	}
-	return certPEM, keyPEM, nil
-}
-
-// GetCertificate fetches a TLS certificate for the TLS ClientHello in hi.
-//
-// It returns a cached certificate from disk if it's still valid.
-//
-// It's the right signature to use as the value of
-// tls.Config.GetCertificate.
-//
-// Deprecated: use Client.GetCertificate.
-func GetCertificate(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	return defaultClient.GetCertificate(hi)
-}
-
-// GetCertificate fetches a TLS certificate for the TLS ClientHello in hi.
-//
-// It returns a cached certificate from disk if it's still valid.
-//
-// It's the right signature to use as the value of
-// tls.Config.GetCertificate.
-//
-// API maturity: this is considered a stable API.
-func (lc *Client) GetCertificate(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	if hi == nil || hi.ServerName == "" {
-		return nil, errors.New("no SNI ServerName")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	name := hi.ServerName
-	if !strings.Contains(name, ".") {
-		if v, ok := lc.ExpandSNIName(ctx, name); ok {
-			name = v
-		}
-	}
-	certPEM, keyPEM, err := lc.CertPair(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, err
-	}
-	return &cert, nil
-}
-
-// ExpandSNIName expands bare label name into the most likely actual TLS cert name.
-//
-// Deprecated: use Client.ExpandSNIName.
-func ExpandSNIName(ctx context.Context, name string) (fqdn string, ok bool) {
-	return defaultClient.ExpandSNIName(ctx, name)
-}
-
-// ExpandSNIName expands bare label name into the most likely actual TLS cert name.
-func (lc *Client) ExpandSNIName(ctx context.Context, name string) (fqdn string, ok bool) {
-	st, err := lc.StatusWithoutPeers(ctx)
-	if err != nil {
-		return "", false
-	}
-	for _, d := range st.CertDomains {
-		if len(d) > len(name)+1 && strings.HasPrefix(d, name) && d[len(name)] == '.' {
-			return d, true
-		}
-	}
-	return "", false
-}
-
 // PingOpts contains options for the ping request.
 //
 // The zero value is valid, which means to use defaults.
@@ -1165,197 +1042,6 @@ func (lc *Client) Ping(ctx context.Context, ip netip.Addr, pingtype tailcfg.Ping
 	return lc.PingWithOpts(ctx, ip, pingtype, PingOpts{})
 }
 
-// NetworkLockStatus fetches information about the tailnet key authority, if one is configured.
-func (lc *Client) NetworkLockStatus(ctx context.Context) (*ipnstate.NetworkLockStatus, error) {
-	body, err := lc.send(ctx, "GET", "/localapi/v0/tka/status", 200, nil)
-	if err != nil {
-		return nil, fmt.Errorf("error: %w", err)
-	}
-	return decodeJSON[*ipnstate.NetworkLockStatus](body)
-}
-
-// NetworkLockInit initializes the tailnet key authority.
-//
-// TODO(tom): Plumb through disablement secrets.
-func (lc *Client) NetworkLockInit(ctx context.Context, keys []tka.Key, disablementValues [][]byte, supportDisablement []byte) (*ipnstate.NetworkLockStatus, error) {
-	var b bytes.Buffer
-	type initRequest struct {
-		Keys               []tka.Key
-		DisablementValues  [][]byte
-		SupportDisablement []byte
-	}
-
-	if err := json.NewEncoder(&b).Encode(initRequest{Keys: keys, DisablementValues: disablementValues, SupportDisablement: supportDisablement}); err != nil {
-		return nil, err
-	}
-
-	body, err := lc.send(ctx, "POST", "/localapi/v0/tka/init", 200, &b)
-	if err != nil {
-		return nil, fmt.Errorf("error: %w", err)
-	}
-	return decodeJSON[*ipnstate.NetworkLockStatus](body)
-}
-
-// NetworkLockWrapPreauthKey wraps a pre-auth key with information to
-// enable unattended bringup in the locked tailnet.
-func (lc *Client) NetworkLockWrapPreauthKey(ctx context.Context, preauthKey string, tkaKey key.NLPrivate) (string, error) {
-	encodedPrivate, err := tkaKey.MarshalText()
-	if err != nil {
-		return "", err
-	}
-
-	var b bytes.Buffer
-	type wrapRequest struct {
-		TSKey  string
-		TKAKey string // key.NLPrivate.MarshalText
-	}
-	if err := json.NewEncoder(&b).Encode(wrapRequest{TSKey: preauthKey, TKAKey: string(encodedPrivate)}); err != nil {
-		return "", err
-	}
-
-	body, err := lc.send(ctx, "POST", "/localapi/v0/tka/wrap-preauth-key", 200, &b)
-	if err != nil {
-		return "", fmt.Errorf("error: %w", err)
-	}
-	return string(body), nil
-}
-
-// NetworkLockModify adds and/or removes key(s) to the tailnet key authority.
-func (lc *Client) NetworkLockModify(ctx context.Context, addKeys, removeKeys []tka.Key) error {
-	var b bytes.Buffer
-	type modifyRequest struct {
-		AddKeys    []tka.Key
-		RemoveKeys []tka.Key
-	}
-
-	if err := json.NewEncoder(&b).Encode(modifyRequest{AddKeys: addKeys, RemoveKeys: removeKeys}); err != nil {
-		return err
-	}
-
-	if _, err := lc.send(ctx, "POST", "/localapi/v0/tka/modify", 204, &b); err != nil {
-		return fmt.Errorf("error: %w", err)
-	}
-	return nil
-}
-
-// NetworkLockSign signs the specified node-key and transmits that signature to the control plane.
-// rotationPublic, if specified, must be an ed25519 public key.
-func (lc *Client) NetworkLockSign(ctx context.Context, nodeKey key.NodePublic, rotationPublic []byte) error {
-	var b bytes.Buffer
-	type signRequest struct {
-		NodeKey        key.NodePublic
-		RotationPublic []byte
-	}
-
-	if err := json.NewEncoder(&b).Encode(signRequest{NodeKey: nodeKey, RotationPublic: rotationPublic}); err != nil {
-		return err
-	}
-
-	if _, err := lc.send(ctx, "POST", "/localapi/v0/tka/sign", 200, &b); err != nil {
-		return fmt.Errorf("error: %w", err)
-	}
-	return nil
-}
-
-// NetworkLockAffectedSigs returns all signatures signed by the specified keyID.
-func (lc *Client) NetworkLockAffectedSigs(ctx context.Context, keyID tkatype.KeyID) ([]tkatype.MarshaledSignature, error) {
-	body, err := lc.send(ctx, "POST", "/localapi/v0/tka/affected-sigs", 200, bytes.NewReader(keyID))
-	if err != nil {
-		return nil, fmt.Errorf("error: %w", err)
-	}
-	return decodeJSON[[]tkatype.MarshaledSignature](body)
-}
-
-// NetworkLockLog returns up to maxEntries number of changes to network-lock state.
-func (lc *Client) NetworkLockLog(ctx context.Context, maxEntries int) ([]ipnstate.NetworkLockUpdate, error) {
-	v := url.Values{}
-	v.Set("limit", fmt.Sprint(maxEntries))
-	body, err := lc.send(ctx, "GET", "/localapi/v0/tka/log?"+v.Encode(), 200, nil)
-	if err != nil {
-		return nil, fmt.Errorf("error %w: %s", err, body)
-	}
-	return decodeJSON[[]ipnstate.NetworkLockUpdate](body)
-}
-
-// NetworkLockForceLocalDisable forcibly shuts down network lock on this node.
-func (lc *Client) NetworkLockForceLocalDisable(ctx context.Context) error {
-	// This endpoint expects an empty JSON stanza as the payload.
-	var b bytes.Buffer
-	if err := json.NewEncoder(&b).Encode(struct{}{}); err != nil {
-		return err
-	}
-
-	if _, err := lc.send(ctx, "POST", "/localapi/v0/tka/force-local-disable", 200, &b); err != nil {
-		return fmt.Errorf("error: %w", err)
-	}
-	return nil
-}
-
-// NetworkLockVerifySigningDeeplink verifies the network lock deeplink contained
-// in url and returns information extracted from it.
-func (lc *Client) NetworkLockVerifySigningDeeplink(ctx context.Context, url string) (*tka.DeeplinkValidationResult, error) {
-	vr := struct {
-		URL string
-	}{url}
-
-	body, err := lc.send(ctx, "POST", "/localapi/v0/tka/verify-deeplink", 200, jsonBody(vr))
-	if err != nil {
-		return nil, fmt.Errorf("sending verify-deeplink: %w", err)
-	}
-
-	return decodeJSON[*tka.DeeplinkValidationResult](body)
-}
-
-// NetworkLockGenRecoveryAUM generates an AUM for recovering from a tailnet-lock key compromise.
-func (lc *Client) NetworkLockGenRecoveryAUM(ctx context.Context, removeKeys []tkatype.KeyID, forkFrom tka.AUMHash) ([]byte, error) {
-	vr := struct {
-		Keys     []tkatype.KeyID
-		ForkFrom string
-	}{removeKeys, forkFrom.String()}
-
-	body, err := lc.send(ctx, "POST", "/localapi/v0/tka/generate-recovery-aum", 200, jsonBody(vr))
-	if err != nil {
-		return nil, fmt.Errorf("sending generate-recovery-aum: %w", err)
-	}
-
-	return body, nil
-}
-
-// NetworkLockCosignRecoveryAUM co-signs a recovery AUM using the node's tailnet lock key.
-func (lc *Client) NetworkLockCosignRecoveryAUM(ctx context.Context, aum tka.AUM) ([]byte, error) {
-	r := bytes.NewReader(aum.Serialize())
-	body, err := lc.send(ctx, "POST", "/localapi/v0/tka/cosign-recovery-aum", 200, r)
-	if err != nil {
-		return nil, fmt.Errorf("sending cosign-recovery-aum: %w", err)
-	}
-
-	return body, nil
-}
-
-// NetworkLockSubmitRecoveryAUM submits a recovery AUM to the control plane.
-func (lc *Client) NetworkLockSubmitRecoveryAUM(ctx context.Context, aum tka.AUM) error {
-	r := bytes.NewReader(aum.Serialize())
-	_, err := lc.send(ctx, "POST", "/localapi/v0/tka/submit-recovery-aum", 200, r)
-	if err != nil {
-		return fmt.Errorf("sending cosign-recovery-aum: %w", err)
-	}
-	return nil
-}
-
-// SetServeConfig sets or replaces the serving settings.
-// If config is nil, settings are cleared and serving is disabled.
-func (lc *Client) SetServeConfig(ctx context.Context, config *ipn.ServeConfig) error {
-	h := make(http.Header)
-	if config != nil {
-		h.Set("If-Match", config.ETag)
-	}
-	_, _, err := lc.sendWithHeaders(ctx, "POST", "/localapi/v0/serve-config", 200, jsonBody(config), h)
-	if err != nil {
-		return fmt.Errorf("sending serve config: %w", err)
-	}
-	return nil
-}
-
 // DisconnectControl shuts down all connections to control, thus making control consider this node inactive. This can be
 // run on HA subnet router or app connector replicas before shutting them down to ensure peers get told to switch over
 // to another replica whilst there is still some grace period for the existing connections to terminate.
@@ -1365,40 +1051,6 @@ func (lc *Client) DisconnectControl(ctx context.Context) error {
 		return fmt.Errorf("error disconnecting control: %w", err)
 	}
 	return nil
-}
-
-// NetworkLockDisable shuts down network-lock across the tailnet.
-func (lc *Client) NetworkLockDisable(ctx context.Context, secret []byte) error {
-	if _, err := lc.send(ctx, "POST", "/localapi/v0/tka/disable", 200, bytes.NewReader(secret)); err != nil {
-		return fmt.Errorf("error: %w", err)
-	}
-	return nil
-}
-
-// GetServeConfig return the current serve config.
-//
-// If the serve config is empty, it returns (nil, nil).
-func (lc *Client) GetServeConfig(ctx context.Context) (*ipn.ServeConfig, error) {
-	body, h, err := lc.sendWithHeaders(ctx, "GET", "/localapi/v0/serve-config", 200, nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("getting serve config: %w", err)
-	}
-	sc, err := getServeConfigFromJSON(body)
-	if err != nil {
-		return nil, err
-	}
-	if sc == nil {
-		sc = new(ipn.ServeConfig)
-	}
-	sc.ETag = h.Get("Etag")
-	return sc, nil
-}
-
-func getServeConfigFromJSON(body []byte) (sc *ipn.ServeConfig, err error) {
-	if err := json.Unmarshal(body, &sc); err != nil {
-		return nil, err
-	}
-	return sc, nil
 }
 
 // tailscaledConnectHint gives a little thing about why tailscaled (or
@@ -1419,7 +1071,7 @@ func tailscaledConnectHint() string {
 	// ActiveState=inactive
 	// SubState=dead
 	st := map[string]string{}
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if k, v, ok := strings.Cut(line, "="); ok {
 			st[k] = strings.TrimSpace(v)
 		}
@@ -1502,9 +1154,9 @@ func (lc *Client) SwitchProfile(ctx context.Context, profile ipn.ProfileID) erro
 
 // DeleteProfile removes the profile with the given ID.
 // If the profile is the current profile, an empty profile
-// will be selected as if SwitchToEmptyProfile was called.
+// will be selected as if [Client.SwitchToEmptyProfile] was called.
 func (lc *Client) DeleteProfile(ctx context.Context, profile ipn.ProfileID) error {
-	_, err := lc.send(ctx, "DELETE", "/localapi/v0/profiles"+url.PathEscape(string(profile)), http.StatusNoContent, nil)
+	_, err := lc.send(ctx, "DELETE", "/localapi/v0/profiles/"+url.PathEscape(string(profile)), http.StatusNoContent, nil)
 	return err
 }
 
@@ -1556,10 +1208,20 @@ func (lc *Client) DebugSetExpireIn(ctx context.Context, d time.Duration) error {
 	return err
 }
 
+// DebugPeerRelaySessions returns debug information about the current peer
+// relay sessions running through this node.
+func (lc *Client) DebugPeerRelaySessions(ctx context.Context) (*status.ServerStatus, error) {
+	body, err := lc.send(ctx, "GET", "/localapi/v0/debug-peer-relay-sessions", 200, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error %w: %s", err, body)
+	}
+	return decodeJSON[*status.ServerStatus](body)
+}
+
 // StreamDebugCapture streams a pcap-formatted packet capture.
 //
 // The provided context does not determine the lifetime of the
-// returned io.ReadCloser.
+// returned [io.ReadCloser].
 func (lc *Client) StreamDebugCapture(ctx context.Context) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", "http://"+apitype.LocalAPIHost+"/localapi/v0/debug-capture", nil)
 	if err != nil {
@@ -1582,7 +1244,7 @@ func (lc *Client) StreamDebugCapture(ctx context.Context) (io.ReadCloser, error)
 // The context is used for the life of the watch, not just the call to
 // WatchIPNBus.
 //
-// The returned IPNBusWatcher's Close method must be called when done to release
+// The returned [IPNBusWatcher]'s Close method must be called when done to release
 // resources.
 //
 // A default set of ipn.Notify messages are returned but the set can be modified by mask.
@@ -1609,7 +1271,7 @@ func (lc *Client) WatchIPNBus(ctx context.Context, mask ipn.NotifyWatchOpt) (*IP
 	}, nil
 }
 
-// CheckUpdate returns a tailcfg.ClientVersion indicating whether or not an update is available
+// CheckUpdate returns a [*tailcfg.ClientVersion] indicating whether or not an update is available
 // to be installed via the LocalAPI. In case the LocalAPI can't install updates, it returns a
 // ClientVersion that says that we are up to date.
 func (lc *Client) CheckUpdate(ctx context.Context) (*tailcfg.ClientVersion, error) {
@@ -1685,7 +1347,7 @@ func (lc *Client) DriveShareList(ctx context.Context) ([]*drive.Share, error) {
 }
 
 // IPNBusWatcher is an active subscription (watch) of the local tailscaled IPN bus.
-// It's returned by Client.WatchIPNBus.
+// It's returned by [Client.WatchIPNBus].
 //
 // It must be closed when done.
 type IPNBusWatcher struct {
@@ -1693,7 +1355,7 @@ type IPNBusWatcher struct {
 	httpRes *http.Response
 	dec     *json.Decoder
 
-	mu     sync.Mutex
+	mu     syncs.Mutex
 	closed bool
 }
 
@@ -1728,4 +1390,45 @@ func (lc *Client) SuggestExitNode(ctx context.Context) (apitype.ExitNodeSuggesti
 		return apitype.ExitNodeSuggestionResponse{}, err
 	}
 	return decodeJSON[apitype.ExitNodeSuggestionResponse](body)
+}
+
+// CheckSOMarkInUse reports whether the socket mark option is in use. This will only
+// be true if tailscale is running on Linux and tailscaled uses SO_MARK.
+func (lc *Client) CheckSOMarkInUse(ctx context.Context) (bool, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/check-so-mark-in-use")
+	if err != nil {
+		return false, err
+	}
+	var res struct {
+		UseSOMark bool `json:"useSoMark"`
+	}
+
+	if err := json.Unmarshal(body, &res); err != nil {
+		return false, fmt.Errorf("invalid JSON from check-so-mark-in-use: %w", err)
+	}
+	return res.UseSOMark, nil
+}
+
+// ShutdownTailscaled requests a graceful shutdown of tailscaled.
+func (lc *Client) ShutdownTailscaled(ctx context.Context) error {
+	_, err := lc.send(ctx, "POST", "/localapi/v0/shutdown", 200, nil)
+	return err
+}
+
+func (lc *Client) GetAppConnectorRouteInfo(ctx context.Context) (appctype.RouteInfo, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/appc-route-info")
+	if err != nil {
+		return appctype.RouteInfo{}, err
+	}
+	return decodeJSON[appctype.RouteInfo](body)
+}
+
+// GetServices returns the Services visible to this node,
+// including their names, IP addresses, and ports, keyed by service name.
+func (lc *Client) GetServices(ctx context.Context) (map[tailcfg.ServiceName]tailcfg.ServiceDetails, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/services")
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSON[map[tailcfg.ServiceName]tailcfg.ServiceDetails](body)
 }

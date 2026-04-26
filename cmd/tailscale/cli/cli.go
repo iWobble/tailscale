@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package cli contains the cmd/tailscale CLI code in a package that can be included
@@ -6,7 +6,9 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,16 +19,16 @@ import (
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 
-	"github.com/mattn/go-colorable"
-	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/local"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
 	"tailscale.com/paths"
 	"tailscale.com/util/slicesx"
+	"tailscale.com/util/testenv"
 	"tailscale.com/version/distro"
 )
 
@@ -65,15 +67,22 @@ func newFlagSet(name string) *flag.FlagSet {
 func CleanUpArgs(args []string) []string {
 	out := make([]string, 0, len(args))
 	for _, arg := range args {
+		switch {
 		// Rewrite --authkey to --auth-key, and --authkey=x to --auth-key=x,
 		// and the same for the -authkey variant.
-		switch {
 		case arg == "--authkey", arg == "-authkey":
 			arg = "--auth-key"
 		case strings.HasPrefix(arg, "--authkey="), strings.HasPrefix(arg, "-authkey="):
-			arg = strings.TrimLeft(arg, "-")
-			arg = strings.TrimPrefix(arg, "authkey=")
-			arg = "--auth-key=" + arg
+			_, val, _ := strings.Cut(arg, "=")
+			arg = "--auth-key=" + val
+
+		// And the same, for posture-checking => report-posture
+		case arg == "--posture-checking", arg == "-posture-checking":
+			arg = "--report-posture"
+		case strings.HasPrefix(arg, "--posture-checking="), strings.HasPrefix(arg, "-posture-checking="):
+			_, val, _ := strings.Cut(arg, "=")
+			arg = "--report-posture=" + val
+
 		}
 		out = append(out, arg)
 	}
@@ -105,7 +114,7 @@ func Run(args []string) (err error) {
 	}
 
 	var warnOnce sync.Once
-	tailscale.SetVersionMismatchHandler(func(clientVer, serverVer string) {
+	local.SetVersionMismatchHandler(func(clientVer, serverVer string) {
 		warnOnce.Do(func() {
 			fmt.Fprintf(Stderr, "Warning: client version %q != tailscaled server version %q\n", clientVer, serverVer)
 		})
@@ -116,7 +125,7 @@ func Run(args []string) (err error) {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
-		if noexec := (ffcli.NoExecError{}); errors.As(err, &noexec) {
+		if noexec, ok := errors.AsType[ffcli.NoExecError](err); ok {
 			// When the user enters an unknown subcommand, ffcli tries to run
 			// the closest valid parent subcommand with everything else as args,
 			// returning NoExecError if it doesn't have an Exec function.
@@ -156,8 +165,8 @@ func Run(args []string) (err error) {
 	}
 
 	err = rootCmd.Run(context.Background())
-	if tailscale.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
-		return fmt.Errorf("%v\n\nUse 'sudo tailscale %s' or 'tailscale up --operator=$USER' to not require root.", err, strings.Join(args, " "))
+	if local.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
+		return fmt.Errorf("%v\n\nUse 'sudo tailscale %s'.\nTo not require root, use 'sudo tailscale set --operator=$USER' once.", err, strings.Join(args, " "))
 	}
 	if errors.Is(err, flag.ErrHelp) {
 		return nil
@@ -165,7 +174,77 @@ func Run(args []string) (err error) {
 	return err
 }
 
-func newRootCmd() *ffcli.Command {
+type onceFlagValue struct {
+	flag.Value
+	set bool
+}
+
+func (v *onceFlagValue) Set(s string) error {
+	if v.set {
+		return fmt.Errorf("flag provided multiple times")
+	}
+	v.set = true
+	return v.Value.Set(s)
+}
+
+func (v *onceFlagValue) IsBoolFlag() bool {
+	type boolFlag interface {
+		IsBoolFlag() bool
+	}
+	bf, ok := v.Value.(boolFlag)
+	return ok && bf.IsBoolFlag()
+}
+
+// noDupFlagify modifies c recursively to make all the flag values be
+// wrappers that permit setting the value at most once. If tb is
+// non-nil, the original values are restored when the test completes.
+func noDupFlagify(c *ffcli.Command, tb testenv.TB) {
+	if tb == nil && testenv.InTest() {
+		return
+	}
+	type restore struct {
+		f *flag.Flag
+		v flag.Value
+	}
+	var restores []restore
+	var walk func(*ffcli.Command)
+	walk = func(c *ffcli.Command) {
+		if c.FlagSet != nil {
+			c.FlagSet.VisitAll(func(f *flag.Flag) {
+				if tb != nil {
+					restores = append(restores, restore{f, f.Value})
+				}
+				f.Value = &onceFlagValue{Value: f.Value}
+			})
+		}
+		for _, sub := range c.Subcommands {
+			walk(sub)
+		}
+	}
+	walk(c)
+	if tb != nil {
+		tb.Cleanup(func() {
+			for _, r := range restores {
+				r.f.Value = r.v
+			}
+		})
+	}
+}
+
+var (
+	fileCmd,
+	sysPolicyCmd,
+	maybeWebCmd,
+	maybeDriveCmd,
+	maybeNetlockCmd,
+	maybeFunnelCmd,
+	maybeServeCmd,
+	maybeCertCmd,
+	maybeUpdateCmd,
+	_ func() *ffcli.Command
+)
+
+func newRootCmd(tb ...testenv.TB) *ffcli.Command {
 	rootfs := newFlagSet("tailscale")
 	rootfs.Func("socket", "path to tailscaled socket", func(s string) error {
 		localClient.Socket = s
@@ -173,8 +252,10 @@ func newRootCmd() *ffcli.Command {
 		return nil
 	})
 	rootfs.Lookup("socket").DefValue = localClient.Socket
+	jsonDocs := rootfs.Bool("json-docs", false, hidden+"print JSON-encoded docs for all subcommands and flags")
 
-	rootCmd := &ffcli.Command{
+	var rootCmd *ffcli.Command
+	rootCmd = &ffcli.Command{
 		Name:       "tailscale",
 		ShortUsage: "tailscale [flags] <subcommand> [command flags]",
 		ShortHelp:  "The easiest, most secure way to use WireGuard.",
@@ -192,7 +273,7 @@ change in the future.
 			logoutCmd,
 			switchCmd,
 			configureCmd(),
-			syspolicyCmd,
+			nilOrCall(sysPolicyCmd),
 			netcheckCmd,
 			ipCmd,
 			dnsCmd,
@@ -201,26 +282,31 @@ change in the future.
 			pingCmd,
 			ncCmd,
 			sshCmd,
-			funnelCmd(),
-			serveCmd(),
+			nilOrCall(maybeFunnelCmd),
+			nilOrCall(maybeServeCmd),
 			versionCmd,
-			webCmd,
-			fileCmd,
+			nilOrCall(maybeWebCmd),
+			nilOrCall(fileCmd),
 			bugReportCmd,
-			certCmd,
-			netlockCmd,
+			nilOrCall(maybeCertCmd),
+			nilOrCall(maybeNetlockCmd),
 			licensesCmd,
 			exitNodeCmd(),
-			updateCmd,
+			nilOrCall(maybeUpdateCmd),
 			whoisCmd,
 			debugCmd(),
-			driveCmd,
+			nilOrCall(maybeDriveCmd),
 			idTokenCmd,
-			advertiseCmd(),
 			configureHostCmd(),
+			systrayCmd,
+			appcRoutesCmd,
+			waitCmd,
 		),
 		FlagSet: rootfs,
 		Exec: func(ctx context.Context, args []string) error {
+			if *jsonDocs {
+				return printJSONDocs(rootCmd)
+			}
 			if len(args) > 0 {
 				return fmt.Errorf("tailscale: unknown subcommand: %s", args[0])
 			}
@@ -232,15 +318,31 @@ change in the future.
 		if w.UsageFunc == nil {
 			w.UsageFunc = usageFunc
 		}
+		if w.FlagSet != nil {
+			// If flags cannot be parsed, redact any keys in the error output .
+			w.FlagSet.SetOutput(sanitizeOutput(w.FlagSet.Output()))
+		}
 		return true
 	})
 
 	ffcomplete.Inject(rootCmd, func(c *ffcli.Command) { c.LongHelp = hidden + c.LongHelp }, usageFunc)
+	var t testenv.TB
+	if len(tb) > 0 {
+		t = tb[0]
+	}
+	noDupFlagify(rootCmd, t)
 	return rootCmd
 }
 
 func nonNilCmds(cmds ...*ffcli.Command) []*ffcli.Command {
 	return slicesx.AppendNonzero(cmds[:0], cmds)
+}
+
+func nilOrCall(f func() *ffcli.Command) *ffcli.Command {
+	if f == nil {
+		return nil
+	}
+	return f()
 }
 
 func fatalf(format string, a ...any) {
@@ -407,16 +509,116 @@ func countFlags(fs *flag.FlagSet) (n int) {
 	return n
 }
 
-// colorableOutput returns a colorable writer if stdout is a terminal (not, say,
-// redirected to a file or pipe), the Stdout writer is os.Stdout (we're not
-// embedding the CLI in wasm or a mobile app), and NO_COLOR is not set (see
-// https://no-color.org/). If any of those is not the case, ok is false
-// and w is Stdout.
-func colorableOutput() (w io.Writer, ok bool) {
-	if Stdout != os.Stdout ||
-		os.Getenv("NO_COLOR") != "" ||
-		!isatty.IsTerminal(os.Stdout.Fd()) {
-		return Stdout, false
+type commandDoc struct {
+	Name        string
+	Desc        string
+	Subcommands []commandDoc `json:",omitempty"`
+	Flags       []flagDoc    `json:",omitempty"`
+}
+
+type flagDoc struct {
+	Name string
+	Desc string
+}
+
+func printJSONDocs(root *ffcli.Command) error {
+	docs := jsonDocsWalk(root)
+	return json.NewEncoder(os.Stdout).Encode(docs)
+}
+
+func jsonDocsWalk(cmd *ffcli.Command) *commandDoc {
+	res := &commandDoc{
+		Name: cmd.Name,
 	}
-	return colorable.NewColorableStdout(), true
+	if cmd.LongHelp != "" {
+		res.Desc = cmd.LongHelp
+	} else if cmd.ShortHelp != "" {
+		res.Desc = cmd.ShortHelp
+	} else {
+		res.Desc = cmd.ShortUsage
+	}
+	if strings.HasPrefix(res.Desc, hidden) {
+		return nil
+	}
+	if cmd.FlagSet != nil {
+		cmd.FlagSet.VisitAll(func(f *flag.Flag) {
+			if strings.HasPrefix(f.Usage, hidden) {
+				return
+			}
+			res.Flags = append(res.Flags, flagDoc{
+				Name: f.Name,
+				Desc: f.Usage,
+			})
+		})
+	}
+	for _, sub := range cmd.Subcommands {
+		subj := jsonDocsWalk(sub)
+		if subj != nil {
+			res.Subcommands = append(res.Subcommands, *subj)
+		}
+	}
+	return res
+}
+
+func lastSeenFmt(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := max(time.Since(t), time.Minute) // at least 1 minute
+
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf(", last seen %dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf(", last seen %dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf(", last seen %dd ago", int(d.Hours()/24))
+	}
+}
+
+var hookFixTailscaledConnectError feature.Hook[func(error) error] // for cliconndiag
+
+func fixTailscaledConnectError(origErr error) error {
+	if f, ok := hookFixTailscaledConnectError.GetOk(); ok {
+		return f(origErr)
+	}
+	return origErr
+}
+
+func sanitizeOutput(w io.Writer) io.Writer {
+	return sanitizeWriter{w}
+}
+
+type sanitizeWriter struct {
+	w io.Writer
+}
+
+// Write logically replaces /tskey-[A-Za-z0-9-]+/ with /tskey-XXXX.../ in buf
+// before writing to the underlying writer.
+//
+// We avoid the "regexp" package to not bloat the minbox build, and without
+// making this a featuretag-omittable protection.
+func (w sanitizeWriter) Write(buf []byte) (int, error) {
+	const prefix = "tskey-"
+	scrub := buf
+	for {
+		i := bytes.Index(scrub, []byte(prefix))
+		if i == -1 {
+			break
+		}
+		scrub = scrub[i+len(prefix):]
+
+		for i, b := range scrub {
+			if (b >= 'a' && b <= 'z') ||
+				(b >= 'A' && b <= 'Z') ||
+				(b >= '0' && b <= '9') ||
+				b == '-' {
+				scrub[i] = 'X'
+			} else {
+				break
+			}
+		}
+	}
+
+	return w.w.Write(buf)
 }

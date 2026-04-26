@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package kubeapi contains Kubernetes API types for internal consumption.
@@ -151,6 +151,14 @@ type Secret struct {
 	// data value here. Described in https://tools.ietf.org/html/rfc4648#section-4
 	// +optional
 	Data map[string][]byte `json:"data,omitempty"`
+}
+
+// SecretList is a list of Secret objects.
+type SecretList struct {
+	TypeMeta   `json:",inline"`
+	ObjectMeta `json:"metadata"`
+
+	Items []Secret `json:"items,omitempty"`
 }
 
 // Event contains a subset of fields from corev1.Event.

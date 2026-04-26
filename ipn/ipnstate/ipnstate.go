@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package ipnstate captures the entire state of the Tailscale network.
@@ -20,7 +20,6 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/version"
@@ -89,6 +88,7 @@ type Status struct {
 
 // TKAKey describes a key trusted by network lock.
 type TKAKey struct {
+	Kind     string
 	Key      key.NLPublic
 	Metadata map[string]string
 	Votes    uint
@@ -216,6 +216,11 @@ type PeerStatusLite struct {
 }
 
 // PeerStatus describes a peer node and its current state.
+// WARNING: The fields in PeerStatus are merged by the AddPeer method in the StatusBuilder.
+// When adding a new field to PeerStatus, you must update AddPeer to handle merging
+// the new field. The AddPeer function is responsible for combining multiple updates
+// to the same peer, and any new field that is not merged properly may lead to
+// inconsistencies or lost data in the peer status.
 type PeerStatus struct {
 	ID        tailcfg.StableNodeID
 	PublicKey key.NodePublic
@@ -246,9 +251,10 @@ type PeerStatus struct {
 	PrimaryRoutes *views.Slice[netip.Prefix] `json:",omitempty"`
 
 	// Endpoints:
-	Addrs   []string
-	CurAddr string // one of Addrs, or unique if roaming
-	Relay   string // DERP region
+	Addrs     []string
+	CurAddr   string // one of Addrs, or unique if roaming
+	Relay     string // DERP region
+	PeerRelay string // peer relay address (ip:port:vni)
 
 	RxBytes        int64
 	TxBytes        int64
@@ -446,6 +452,9 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	if v := st.Relay; v != "" {
 		e.Relay = v
 	}
+	if v := st.PeerRelay; v != "" {
+		e.PeerRelay = v
+	}
 	if v := st.UserID; v != 0 {
 		e.UserID = v
 	}
@@ -525,13 +534,16 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 		e.Expired = true
 	}
 	if t := st.KeyExpiry; t != nil {
-		e.KeyExpiry = ptr.To(*t)
+		e.KeyExpiry = new(*t)
 	}
 	if v := st.CapMap; v != nil {
 		e.CapMap = v
 	}
 	if v := st.Capabilities; v != nil {
 		e.Capabilities = v
+	}
+	if v := st.TaildropTarget; v != TaildropTargetUnknown {
+		e.TaildropTarget = v
 	}
 	e.Location = st.Location
 }
@@ -689,9 +701,16 @@ type PingResult struct {
 	Err            string
 	LatencySeconds float64
 
-	// Endpoint is the ip:port if direct UDP was used.
-	// It is not currently set for TSMP pings.
+	// Endpoint is a string of the form "{ip}:{port}" if direct UDP was used. It
+	// is not currently set for TSMP.
 	Endpoint string
+
+	// PeerRelay is a string of the form "{ip}:{port}:vni:{vni}" if a peer
+	// relay was used. It is not currently set for TSMP. Note that this field
+	// is not omitted during JSON encoding if it contains a zero value. This is
+	// done for consistency with the Endpoint field; this structure is exposed
+	// externally via localAPI, so we want to maintain the existing convention.
+	PeerRelay string
 
 	// DERPRegionID is non-zero DERP region ID if DERP was used.
 	// It is not currently set for TSMP pings.
@@ -727,6 +746,7 @@ func (pr *PingResult) ToPingResponse(pingType tailcfg.PingType) *tailcfg.PingRes
 		Err:            pr.Err,
 		LatencySeconds: pr.LatencySeconds,
 		Endpoint:       pr.Endpoint,
+		PeerRelay:      pr.PeerRelay,
 		DERPRegionID:   pr.DERPRegionID,
 		DERPRegionCode: pr.DERPRegionCode,
 		PeerAPIPort:    pr.PeerAPIPort,

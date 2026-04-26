@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package distsign implements signature and validation of arbitrary
@@ -55,7 +55,7 @@ import (
 
 	"github.com/hdevalence/ed25519consensus"
 	"golang.org/x/crypto/blake2s"
-	"tailscale.com/net/tshttpproxy"
+	"tailscale.com/feature"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/must"
@@ -330,9 +330,15 @@ func fetch(url string, limit int64) ([]byte, error) {
 // limit bytes. On success, the returned value is a BLAKE2s hash of the file.
 func (c *Client) download(ctx context.Context, url, dst string, limit int64) ([]byte, int64, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.Proxy = tshttpproxy.ProxyFromEnvironment
+	tr.Proxy = feature.HookProxyFromEnvironment.GetOrNil()
 	defer tr.CloseIdleConnections()
-	hc := &http.Client{Transport: tr}
+	hc := &http.Client{
+		Transport: tr,
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			c.logf("Download redirected to %q", r.URL)
+			return nil
+		},
+	}
 
 	quickCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

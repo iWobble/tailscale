@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package prefs
@@ -9,7 +9,6 @@ import (
 	jsonv2 "github.com/go-json-experiment/json"
 	"github.com/go-json-experiment/json/jsontext"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 	"tailscale.com/util/must"
 )
@@ -47,7 +46,7 @@ func (i *Item[T]) SetManagedValue(val T) {
 // It is a runtime error to call [Item.Clone] if T contains pointers
 // but does not implement [views.Cloner].
 func (i Item[T]) Clone() *Item[T] {
-	res := ptr.To(i)
+	res := new(i)
 	if v, ok := i.ValueOk(); ok {
 		res.s.Value.Set(must.Get(deepClone(v)))
 	}
@@ -152,15 +151,15 @@ func (iv ItemView[T, V]) Equal(iv2 ItemView[T, V]) bool {
 	return iv.ж.Equal(*iv2.ж)
 }
 
-// MarshalJSONV2 implements [jsonv2.MarshalerV2].
-func (iv ItemView[T, V]) MarshalJSONV2(out *jsontext.Encoder, opts jsonv2.Options) error {
-	return iv.ж.MarshalJSONV2(out, opts)
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (iv ItemView[T, V]) MarshalJSONTo(out *jsontext.Encoder) error {
+	return iv.ж.MarshalJSONTo(out)
 }
 
-// UnmarshalJSONV2 implements [jsonv2.UnmarshalerV2].
-func (iv *ItemView[T, V]) UnmarshalJSONV2(in *jsontext.Decoder, opts jsonv2.Options) error {
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+func (iv *ItemView[T, V]) UnmarshalJSONFrom(in *jsontext.Decoder) error {
 	var x Item[T]
-	if err := x.UnmarshalJSONV2(in, opts); err != nil {
+	if err := x.UnmarshalJSONFrom(in); err != nil {
 		return err
 	}
 	iv.ж = &x
@@ -169,10 +168,10 @@ func (iv *ItemView[T, V]) UnmarshalJSONV2(in *jsontext.Decoder, opts jsonv2.Opti
 
 // MarshalJSON implements [json.Marshaler].
 func (iv ItemView[T, V]) MarshalJSON() ([]byte, error) {
-	return jsonv2.Marshal(iv) // uses MarshalJSONV2
+	return jsonv2.Marshal(iv) // uses MarshalJSONTo
 }
 
 // UnmarshalJSON implements [json.Unmarshaler].
 func (iv *ItemView[T, V]) UnmarshalJSON(b []byte) error {
-	return jsonv2.Unmarshal(b, iv) // uses UnmarshalJSONV2
+	return jsonv2.Unmarshal(b, iv) // uses UnmarshalJSONFrom
 }

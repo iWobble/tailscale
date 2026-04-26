@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_taildrop
 
 package cli
 
@@ -17,7 +19,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -30,7 +34,6 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsaddr"
-	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	tsrate "tailscale.com/tstime/rate"
 	"tailscale.com/util/quarantine"
@@ -38,14 +41,20 @@ import (
 	"tailscale.com/version"
 )
 
-var fileCmd = &ffcli.Command{
-	Name:       "file",
-	ShortUsage: "tailscale file <cp|get> ...",
-	ShortHelp:  "Send or receive files",
-	Subcommands: []*ffcli.Command{
-		fileCpCmd,
-		fileGetCmd,
-	},
+func init() {
+	fileCmd = getFileCmd
+}
+
+func getFileCmd() *ffcli.Command {
+	return &ffcli.Command{
+		Name:       "file",
+		ShortUsage: "tailscale file <cp|get> ...",
+		ShortHelp:  "Send or receive files",
+		Subcommands: []*ffcli.Command{
+			fileCpCmd,
+			fileGetCmd,
+		},
+	}
 }
 
 type countingReader struct {
@@ -118,10 +127,8 @@ func runCp(ctx context.Context, args []string) error {
 		if cpArgs.name != "" {
 			return errors.New("can't use --name= with multiple files")
 		}
-		for _, fileArg := range files {
-			if fileArg == "-" {
-				return errors.New("can't use '-' as STDIN file when providing filename arguments")
-			}
+		if slices.Contains(files, "-") {
+			return errors.New("can't use '-' as STDIN file when providing filename arguments")
 		}
 	}
 
@@ -168,7 +175,7 @@ func runCp(ctx context.Context, args []string) error {
 			log.Printf("sending %q to %v/%v/%v ...", name, target, ip, stableID)
 		}
 
-		var group syncs.WaitGroup
+		var group sync.WaitGroup
 		ctxProgress, cancelProgress := context.WithCancel(ctx)
 		defer cancelProgress()
 		if isatty.IsTerminal(os.Stderr.Fd()) {

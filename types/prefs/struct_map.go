@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package prefs
@@ -9,7 +9,6 @@ import (
 	jsonv2 "github.com/go-json-experiment/json"
 	"github.com/go-json-experiment/json/jsontext"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 )
 
@@ -31,19 +30,19 @@ func StructMapWithOpts[K MapKeyType, V views.Cloner[V]](opts ...Options) StructM
 // SetValue configures the preference with the specified value.
 // It fails and returns [ErrManaged] if p is a managed preference,
 // and [ErrReadOnly] if p is a read-only preference.
-func (l *StructMap[K, V]) SetValue(val map[K]V) error {
-	return l.preference.SetValue(deepCloneMap(val))
+func (m *StructMap[K, V]) SetValue(val map[K]V) error {
+	return m.preference.SetValue(deepCloneMap(val))
 }
 
 // SetManagedValue configures the preference with the specified value
 // and marks the preference as managed.
-func (l *StructMap[K, V]) SetManagedValue(val map[K]V) {
-	l.preference.SetManagedValue(deepCloneMap(val))
+func (m *StructMap[K, V]) SetManagedValue(val map[K]V) {
+	m.preference.SetManagedValue(deepCloneMap(val))
 }
 
 // Clone returns a copy of m that aliases no memory with m.
 func (m StructMap[K, V]) Clone() *StructMap[K, V] {
-	res := ptr.To(m)
+	res := new(m)
 	if v, ok := m.s.Value.GetOk(); ok {
 		res.s.Value.Set(deepCloneMap(v))
 	}
@@ -149,15 +148,15 @@ func (mv StructMapView[K, T, V]) Equal(mv2 StructMapView[K, T, V]) bool {
 	return mv.ж.Equal(*mv2.ж)
 }
 
-// MarshalJSONV2 implements [jsonv2.MarshalerV2].
-func (mv StructMapView[K, T, V]) MarshalJSONV2(out *jsontext.Encoder, opts jsonv2.Options) error {
-	return mv.ж.MarshalJSONV2(out, opts)
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (mv StructMapView[K, T, V]) MarshalJSONTo(out *jsontext.Encoder) error {
+	return mv.ж.MarshalJSONTo(out)
 }
 
-// UnmarshalJSONV2 implements [jsonv2.UnmarshalerV2].
-func (mv *StructMapView[K, T, V]) UnmarshalJSONV2(in *jsontext.Decoder, opts jsonv2.Options) error {
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+func (mv *StructMapView[K, T, V]) UnmarshalJSONFrom(in *jsontext.Decoder) error {
 	var x StructMap[K, T]
-	if err := x.UnmarshalJSONV2(in, opts); err != nil {
+	if err := x.UnmarshalJSONFrom(in); err != nil {
 		return err
 	}
 	mv.ж = &x
@@ -166,10 +165,10 @@ func (mv *StructMapView[K, T, V]) UnmarshalJSONV2(in *jsontext.Decoder, opts jso
 
 // MarshalJSON implements [json.Marshaler].
 func (mv StructMapView[K, T, V]) MarshalJSON() ([]byte, error) {
-	return jsonv2.Marshal(mv) // uses MarshalJSONV2
+	return jsonv2.Marshal(mv) // uses MarshalJSONTo
 }
 
 // UnmarshalJSON implements [json.Unmarshaler].
 func (mv *StructMapView[K, T, V]) UnmarshalJSON(b []byte) error {
-	return jsonv2.Unmarshal(b, mv) // uses UnmarshalJSONV2
+	return jsonv2.Unmarshal(b, mv) // uses UnmarshalJSONFrom
 }

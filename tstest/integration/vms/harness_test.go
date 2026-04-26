@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !windows && !plan9
@@ -134,11 +134,12 @@ func newHarness(t *testing.T) *Harness {
 	loginServer := fmt.Sprintf("http://%s", ln.Addr())
 	t.Logf("loginServer: %s", loginServer)
 
+	binaries := integration.GetBinaries(t)
 	h := &Harness{
 		pubKey:         string(pubkey),
-		binaryDir:      integration.BinaryDir(t),
-		cli:            integration.TailscaleBinary(t),
-		daemon:         integration.TailscaledBinary(t),
+		binaryDir:      binaries.Dir,
+		cli:            binaries.Tailscale.Path,
+		daemon:         binaries.Tailscaled.Path,
 		signer:         signer,
 		loginServerURL: loginServer,
 		cs:             cs,

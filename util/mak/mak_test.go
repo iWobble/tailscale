@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package mak contains code to help make things.
@@ -38,35 +38,6 @@ func TestSet(t *testing.T) {
 			t.Errorf("got %v; want %v", got, want)
 		}
 	})
-}
-
-func TestNonNil(t *testing.T) {
-	var s []string
-	NonNil(&s)
-	if len(s) != 0 {
-		t.Errorf("slice len = %d; want 0", len(s))
-	}
-	if s == nil {
-		t.Error("slice still nil")
-	}
-
-	s = append(s, "foo")
-	NonNil(&s)
-	if len(s) != 1 {
-		t.Errorf("len = %d; want 1", len(s))
-	}
-	if s[0] != "foo" {
-		t.Errorf("value = %q; want foo", s)
-	}
-
-	var m map[string]string
-	NonNil(&m)
-	if len(m) != 0 {
-		t.Errorf("map len = %d; want 0", len(s))
-	}
-	if m == nil {
-		t.Error("map still nil")
-	}
 }
 
 func TestNonNilMapForJSON(t *testing.T) {

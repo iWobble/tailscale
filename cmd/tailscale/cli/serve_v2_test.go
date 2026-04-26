@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -8,9 +8,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,6 +22,8 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/views"
 )
 
 func TestServeDevConfigMutations(t *testing.T) {
@@ -30,10 +35,11 @@ func TestServeDevConfigMutations(t *testing.T) {
 	}
 
 	// group is a group of steps that share the same
-	// config mutation, but always starts from an empty config
+	// config mutation
 	type group struct {
-		name  string
-		steps []step
+		name         string
+		steps        []step
+		initialState fakeLocalServeClient // use the zero value for empty config
 	}
 
 	// creaet a temporary directory for path-based destinations
@@ -214,10 +220,20 @@ func TestServeDevConfigMutations(t *testing.T) {
 			}},
 		},
 		{
-			name: "invalid_host",
+			name: "ip_host",
+			initialState: fakeLocalServeClient{
+				SOMarkInUse: true,
+			},
 			steps: []step{{
-				command: cmd("serve --https=443 --bg http://somehost:3000"), // invalid host
-				wantErr: anyErr(),
+				command: cmd("serve --https=443 --bg http://192.168.1.1:3000"),
+				want: &ipn.ServeConfig{
+					TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+					Web: map[ipn.HostPort]*ipn.WebServerConfig{
+						"foo.test.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+							"/": {Proxy: "http://192.168.1.1:3000"},
+						}},
+					},
+				},
 			}},
 		},
 		{
@@ -225,6 +241,16 @@ func TestServeDevConfigMutations(t *testing.T) {
 			steps: []step{{
 				command: cmd("serve --https=443 --bg httpz://127.0.0.1"), // invalid scheme
 				wantErr: anyErr(),
+			}},
+		},
+		{
+			name: "no_scheme_remote_host_tcp",
+			initialState: fakeLocalServeClient{
+				SOMarkInUse: true,
+			},
+			steps: []step{{
+				command: cmd("serve --https=443 --bg 192.168.1.1:3000"),
+				wantErr: exactErrMsg(errHelp),
 			}},
 		},
 		{
@@ -397,14 +423,10 @@ func TestServeDevConfigMutations(t *testing.T) {
 			}},
 		},
 		{
-			name: "unknown_host_tcp",
-			steps: []step{{
-				command: cmd("serve --tls-terminated-tcp=443 --bg tcp://somehost:5432"),
-				wantErr: exactErrMsg(errHelp),
-			}},
-		},
-		{
 			name: "tcp_port_too_low",
+			initialState: fakeLocalServeClient{
+				SOMarkInUse: true,
+			},
 			steps: []step{{
 				command: cmd("serve --tls-terminated-tcp=443 --bg tcp://somehost:0"),
 				wantErr: exactErrMsg(errHelp),
@@ -412,6 +434,9 @@ func TestServeDevConfigMutations(t *testing.T) {
 		},
 		{
 			name: "tcp_port_too_high",
+			initialState: fakeLocalServeClient{
+				SOMarkInUse: true,
+			},
 			steps: []step{{
 				command: cmd("serve --tls-terminated-tcp=443 --bg tcp://somehost:65536"),
 				wantErr: exactErrMsg(errHelp),
@@ -526,6 +551,9 @@ func TestServeDevConfigMutations(t *testing.T) {
 		},
 		{
 			name: "bad_path",
+			initialState: fakeLocalServeClient{
+				SOMarkInUse: true,
+			},
 			steps: []step{{
 				command: cmd("serve --bg --https=443 bad/path"),
 				wantErr: exactErrMsg(errHelp),
@@ -792,36 +820,186 @@ func TestServeDevConfigMutations(t *testing.T) {
 			},
 		},
 		{
-			name: "forground_with_bg_conflict",
+			name: "advertise_service",
+			initialState: fakeLocalServeClient{
+				statusWithoutPeers: &ipnstate.Status{
+					BackendState: ipn.Running.String(),
+					Self: &ipnstate.PeerStatus{
+						DNSName: "foo.test.ts.net",
+						CapMap: tailcfg.NodeCapMap{
+							tailcfg.NodeAttrFunnel:                            nil,
+							tailcfg.CapabilityFunnelPorts + "?ports=443,8443": nil,
+						},
+						Tags: ptrToReadOnlySlice([]string{"some-tag"}),
+					},
+					CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+				},
+				SOMarkInUse: true,
+			},
+			steps: []step{{
+				command: cmd("serve --service=svc:foo --http=80 text:foo"),
+				want: &ipn.ServeConfig{
+					Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+						"svc:foo": {
+							TCP: map[uint16]*ipn.TCPPortHandler{
+								80: {HTTP: true},
+							},
+							Web: map[ipn.HostPort]*ipn.WebServerConfig{
+								"foo.test.ts.net:80": {Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Text: "foo"},
+								}},
+							},
+						},
+					},
+				},
+			}},
+		},
+		{
+			name: "advertise_service_from_untagged_node",
+			steps: []step{{
+				command: cmd("serve --service=svc:foo --http=80 text:foo"),
+				wantErr: anyErr(),
+			}},
+		},
+		{
+			name: "forward_grant_header",
 			steps: []step{
 				{
-					command: cmd("serve --bg --http=3000  localhost:3000"),
+					command: cmd("serve --bg --accept-app-caps=example.com/cap/foo 3000"),
 					want: &ipn.ServeConfig{
-						TCP: map[uint16]*ipn.TCPPortHandler{3000: {HTTP: true}},
+						TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
 						Web: map[ipn.HostPort]*ipn.WebServerConfig{
-							"foo.test.ts.net:3000": {Handlers: map[string]*ipn.HTTPHandler{
-								"/": {Proxy: "http://localhost:3000"},
+							"foo.test.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+								"/": {
+									Proxy:         "http://127.0.0.1:3000",
+									AcceptAppCaps: []tailcfg.PeerCapability{"example.com/cap/foo"},
+								},
 							}},
 						},
 					},
 				},
 				{
-					command: cmd("serve --http=3000 localhost:3000"),
-					wantErr: exactErrMsg(fmt.Errorf(backgroundExistsMsg, "serve", "http", 3000)),
+					command: cmd("serve --bg --accept-app-caps=example.com/cap/foo,example.com/cap/bar 3000"),
+					want: &ipn.ServeConfig{
+						TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"foo.test.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+								"/": {
+									Proxy:         "http://127.0.0.1:3000",
+									AcceptAppCaps: []tailcfg.PeerCapability{"example.com/cap/foo", "example.com/cap/bar"},
+								},
+							}},
+						},
+					},
+				},
+				{
+					command: cmd("serve --bg --accept-app-caps=example.com/cap/bar 3000"),
+					want: &ipn.ServeConfig{
+						TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"foo.test.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+								"/": {
+									Proxy:         "http://127.0.0.1:3000",
+									AcceptAppCaps: []tailcfg.PeerCapability{"example.com/cap/bar"},
+								},
+							}},
+						},
+					},
 				},
 			},
+		},
+		{
+			name: "invalid_accept_caps_invalid_app_cap",
+			steps: []step{
+				{
+					command: cmd("serve --bg --accept-app-caps=example.com/cap/fine,NOTFINE 3000"), // should be {domain.tld}/{name}
+					wantErr: func(err error) (badErrMsg string) {
+						if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%q does not match", "NOTFINE")) {
+							return fmt.Sprintf("wanted validation error that quotes the non-matching capability (and nothing more) but got %q", err.Error())
+						}
+						return ""
+					},
+				},
+			},
+		},
+		{
+			name: "tcp_with_proxy_protocol_v1",
+			steps: []step{{
+				command: cmd("serve --tcp=8000 --proxy-protocol=1 --bg tcp://localhost:5432"),
+				want: &ipn.ServeConfig{
+					TCP: map[uint16]*ipn.TCPPortHandler{
+						8000: {
+							TCPForward:    "localhost:5432",
+							ProxyProtocol: 1,
+						},
+					},
+				},
+			}},
+		},
+		{
+			name: "tls_terminated_tcp_with_proxy_protocol_v2",
+			steps: []step{{
+				command: cmd("serve --tls-terminated-tcp=443 --proxy-protocol=2 --bg tcp://localhost:5432"),
+				want: &ipn.ServeConfig{
+					TCP: map[uint16]*ipn.TCPPortHandler{
+						443: {
+							TCPForward:    "localhost:5432",
+							TerminateTLS:  "foo.test.ts.net",
+							ProxyProtocol: 2,
+						},
+					},
+				},
+			}},
+		},
+		{
+			name: "tcp_update_to_add_proxy_protocol",
+			steps: []step{
+				{
+					command: cmd("serve --tcp=8000 --bg tcp://localhost:5432"),
+					want: &ipn.ServeConfig{
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							8000: {TCPForward: "localhost:5432"},
+						},
+					},
+				},
+				{
+					command: cmd("serve --tcp=8000 --proxy-protocol=1 --bg tcp://localhost:5432"),
+					want: &ipn.ServeConfig{
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							8000: {
+								TCPForward:    "localhost:5432",
+								ProxyProtocol: 1,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "tcp_proxy_protocol_invalid_version",
+			steps: []step{{
+				command: cmd("serve --tcp=8000 --proxy-protocol=3 --bg tcp://localhost:5432"),
+				wantErr: anyErr(),
+			}},
+		},
+		{
+			name: "proxy_protocol_without_tcp",
+			steps: []step{{
+				command: cmd("serve --https=443 --proxy-protocol=1 --bg http://localhost:3000"),
+				wantErr: anyErr(),
+			}},
 		},
 	}
 
 	for _, group := range groups {
 		t.Run(group.name, func(t *testing.T) {
-			lc := &fakeLocalServeClient{}
+			lc := group.initialState
 			for i, st := range group.steps {
 				var stderr bytes.Buffer
 				var stdout bytes.Buffer
 				var flagOut bytes.Buffer
 				e := &serveEnv{
-					lc:          lc,
+					lc:          &lc,
 					testFlagOut: &flagOut,
 					testStdout:  &stdout,
 					testStderr:  &stderr,
@@ -869,111 +1047,6 @@ func TestServeDevConfigMutations(t *testing.T) {
 	}
 }
 
-func TestValidateConfig(t *testing.T) {
-	tests := [...]struct {
-		name      string
-		desc      string
-		cfg       *ipn.ServeConfig
-		servePort uint16
-		serveType serveType
-		bg        bool
-		wantErr   bool
-	}{
-		{
-			name:      "nil_config",
-			desc:      "when config is nil, all requests valid",
-			cfg:       nil,
-			servePort: 3000,
-			serveType: serveTypeHTTPS,
-		},
-		{
-			name: "new_bg_tcp",
-			desc: "no error when config exists but we're adding a new bg tcp port",
-			cfg: &ipn.ServeConfig{
-				TCP: map[uint16]*ipn.TCPPortHandler{
-					443: {HTTPS: true},
-				},
-			},
-			bg:        true,
-			servePort: 10000,
-			serveType: serveTypeHTTPS,
-		},
-		{
-			name: "override_bg_tcp",
-			desc: "no error when overwriting previous port under the same serve type",
-			cfg: &ipn.ServeConfig{
-				TCP: map[uint16]*ipn.TCPPortHandler{
-					443: {TCPForward: "http://localhost:4545"},
-				},
-			},
-			bg:        true,
-			servePort: 443,
-			serveType: serveTypeTCP,
-		},
-		{
-			name: "override_bg_tcp",
-			desc: "error when overwriting previous port under a different serve type",
-			cfg: &ipn.ServeConfig{
-				TCP: map[uint16]*ipn.TCPPortHandler{
-					443: {HTTPS: true},
-				},
-			},
-			bg:        true,
-			servePort: 443,
-			serveType: serveTypeHTTP,
-			wantErr:   true,
-		},
-		{
-			name: "new_fg_port",
-			desc: "no error when serving a new foreground port",
-			cfg: &ipn.ServeConfig{
-				TCP: map[uint16]*ipn.TCPPortHandler{
-					443: {HTTPS: true},
-				},
-				Foreground: map[string]*ipn.ServeConfig{
-					"abc123": {
-						TCP: map[uint16]*ipn.TCPPortHandler{
-							3000: {HTTPS: true},
-						},
-					},
-				},
-			},
-			servePort: 4040,
-			serveType: serveTypeTCP,
-		},
-		{
-			name: "same_fg_port",
-			desc: "error when overwriting a previous fg port",
-			cfg: &ipn.ServeConfig{
-				Foreground: map[string]*ipn.ServeConfig{
-					"abc123": {
-						TCP: map[uint16]*ipn.TCPPortHandler{
-							3000: {HTTPS: true},
-						},
-					},
-				},
-			},
-			servePort: 3000,
-			serveType: serveTypeTCP,
-			wantErr:   true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			se := serveEnv{bg: tc.bg}
-			err := se.validateConfig(tc.cfg, tc.servePort, tc.serveType)
-			if err == nil && tc.wantErr {
-				t.Fatal("expected an error but got nil")
-			}
-			if err != nil && !tc.wantErr {
-				t.Fatalf("expected no error but got: %v", err)
-			}
-		})
-	}
-
-}
-
 func TestSrcTypeFromFlags(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -983,42 +1056,49 @@ func TestSrcTypeFromFlags(t *testing.T) {
 		expectedErr  bool
 	}{
 		{
-			name:         "only http set",
+			name:         "only-http-set",
 			env:          &serveEnv{http: 80},
 			expectedType: serveTypeHTTP,
 			expectedPort: 80,
 			expectedErr:  false,
 		},
 		{
-			name:         "only https set",
+			name:         "only-https-set",
 			env:          &serveEnv{https: 10000},
 			expectedType: serveTypeHTTPS,
 			expectedPort: 10000,
 			expectedErr:  false,
 		},
 		{
-			name:         "only tcp set",
+			name:         "only-tcp-set",
 			env:          &serveEnv{tcp: 8000},
 			expectedType: serveTypeTCP,
 			expectedPort: 8000,
 			expectedErr:  false,
 		},
 		{
-			name:         "only tls-terminated-tcp set",
+			name:         "only-tls-terminated-tcp-set",
 			env:          &serveEnv{tlsTerminatedTCP: 8080},
 			expectedType: serveTypeTLSTerminatedTCP,
 			expectedPort: 8080,
 			expectedErr:  false,
 		},
 		{
-			name:         "defaults to https, port 443",
+			name:         "defaults-to-https-443",
 			env:          &serveEnv{},
 			expectedType: serveTypeHTTPS,
 			expectedPort: 443,
 			expectedErr:  false,
 		},
 		{
-			name:         "multiple types set",
+			name:         "defaults-to-https-443-for-service",
+			env:          &serveEnv{service: "svc:foo"},
+			expectedType: serveTypeHTTPS,
+			expectedPort: 443,
+			expectedErr:  false,
+		},
+		{
+			name:         "multiple-types-set",
 			env:          &serveEnv{http: 80, https: 443},
 			expectedPort: 0,
 			expectedErr:  true,
@@ -1041,21 +1121,134 @@ func TestSrcTypeFromFlags(t *testing.T) {
 	}
 }
 
+func TestAcceptSetAppCapsFlag(t *testing.T) {
+	testCases := []struct {
+		name             string
+		inputs           []string
+		expectErr        bool
+		expectErrToMatch *regexp.Regexp
+		expectedValue    []tailcfg.PeerCapability
+	}{
+		{
+			name:          "valid_simple",
+			inputs:        []string{"example.com/name"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"example.com/name"},
+		},
+		{
+			name:          "valid_unicode",
+			inputs:        []string{"bücher.de/something"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"bücher.de/something"},
+		},
+		{
+			name:          "more_valid_unicode",
+			inputs:        []string{"example.tw/某某某"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"example.tw/某某某"},
+		},
+		{
+			name:          "valid_path_slashes",
+			inputs:        []string{"domain.com/path/to/name"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"domain.com/path/to/name"},
+		},
+		{
+			name:          "valid_multiple_sets",
+			inputs:        []string{"one.com/foo,two.com/bar"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"one.com/foo", "two.com/bar"},
+		},
+		{
+			name:          "valid_empty_string",
+			inputs:        []string{""},
+			expectErr:     false,
+			expectedValue: nil, // Empty string should be a no-op and not append anything.
+		},
+		{
+			name:             "invalid_path_chars",
+			inputs:           []string{"domain.com/path_with_underscore"},
+			expectErr:        true,
+			expectErrToMatch: regexp.MustCompile(`"domain.com/path_with_underscore"`),
+			expectedValue:    nil, // Slice should remain empty.
+		},
+		{
+			name:          "valid_subdomain",
+			inputs:        []string{"sub.domain.com/name"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"sub.domain.com/name"},
+		},
+		{
+			name:             "invalid_no_path",
+			inputs:           []string{"domain.com/"},
+			expectErr:        true,
+			expectErrToMatch: regexp.MustCompile(`"domain.com/"`),
+			expectedValue:    nil,
+		},
+		{
+			name:             "invalid_no_domain",
+			inputs:           []string{"/path/only"},
+			expectErr:        true,
+			expectErrToMatch: regexp.MustCompile(`"/path/only"`),
+			expectedValue:    nil,
+		},
+		{
+			name:             "some_invalid_some_valid",
+			inputs:           []string{"one.com/foo,bad/bar,two.com/baz"},
+			expectErr:        true,
+			expectErrToMatch: regexp.MustCompile(`"bad/bar"`),
+			expectedValue:    []tailcfg.PeerCapability{"one.com/foo"}, // Parsing will stop after first error
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var v []tailcfg.PeerCapability
+			flag := &acceptAppCapsFlag{Value: &v}
+
+			var err error
+			for _, s := range tc.inputs {
+				err = flag.Set(s)
+				if err != nil {
+					break
+				}
+			}
+
+			if tc.expectErr && err == nil {
+				t.Errorf("expected an error, but got none")
+			}
+			if tc.expectErrToMatch != nil {
+				if !tc.expectErrToMatch.MatchString(err.Error()) {
+					t.Errorf("expected error to match %q, but was %q", tc.expectErrToMatch, err)
+				}
+			}
+			if !tc.expectErr && err != nil {
+				t.Errorf("did not expect an error, but got: %v", err)
+			}
+
+			if !reflect.DeepEqual(tc.expectedValue, v) {
+				t.Errorf("unexpected value, got: %q, want: %q", v, tc.expectedValue)
+			}
+		})
+	}
+}
+
 func TestCleanURLPath(t *testing.T) {
 	tests := []struct {
+		name     string
 		input    string
 		expected string
 		wantErr  bool
 	}{
-		{input: "", expected: "/"},
-		{input: "/", expected: "/"},
-		{input: "/foo", expected: "/foo"},
-		{input: "/foo/", expected: "/foo/"},
-		{input: "/../bar", wantErr: true},
+		{name: "empty", input: "", expected: "/"},
+		{name: "slash", input: "/", expected: "/"},
+		{name: "foo", input: "/foo", expected: "/foo"},
+		{name: "foo-trailing-slash", input: "/foo/", expected: "/foo/"},
+		{name: "dotdot-bar", input: "/../bar", wantErr: true},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			actual, err := cleanURLPath(tt.input)
 
 			if tt.wantErr == true && err == nil {
@@ -1075,12 +1268,118 @@ func TestCleanURLPath(t *testing.T) {
 	}
 }
 
+func TestAddServiceToPrefs(t *testing.T) {
+	tests := []struct {
+		name          string
+		svcName       tailcfg.ServiceName
+		startServices []string
+		expected      []string
+	}{
+		{
+			name:     "add-service-to-empty-prefs",
+			svcName:  "svc:foo",
+			expected: []string{"svc:foo"},
+		},
+		{
+			name:          "add-service-to-existing-prefs",
+			svcName:       "svc:bar",
+			startServices: []string{"svc:foo"},
+			expected:      []string{"svc:foo", "svc:bar"},
+		},
+		{
+			name:          "add-existing-service-to-prefs",
+			svcName:       "svc:foo",
+			startServices: []string{"svc:foo"},
+			expected:      []string{"svc:foo"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lc := &fakeLocalServeClient{}
+			ctx := t.Context()
+			lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+				AdvertiseServicesSet: true,
+				Prefs: ipn.Prefs{
+					AdvertiseServices: tt.startServices,
+				},
+			})
+			e := &serveEnv{lc: lc, bg: bgBoolFlag{true, false}}
+			err := e.addServiceToPrefs(ctx, tt.svcName)
+			if err != nil {
+				t.Fatalf("addServiceToPrefs(%q) returned unexpected error: %v", tt.svcName, err)
+			}
+			if !slices.Equal(lc.prefs.AdvertiseServices, tt.expected) {
+				t.Errorf("addServiceToPrefs(%q) = %v, want %v", tt.svcName, lc.prefs.AdvertiseServices, tt.expected)
+			}
+		})
+	}
+
+}
+
+func TestRemoveServiceFromPrefs(t *testing.T) {
+	tests := []struct {
+		name          string
+		svcName       tailcfg.ServiceName
+		startServices []string
+		expected      []string
+	}{
+		{
+			name:     "remove-service-from-empty-prefs",
+			svcName:  "svc:foo",
+			expected: []string{},
+		},
+		{
+			name:          "remove-existing-service-from-prefs",
+			svcName:       "svc:foo",
+			startServices: []string{"svc:foo"},
+			expected:      []string{},
+		},
+		{
+			name:          "remove-service-not-in-prefs",
+			svcName:       "svc:bar",
+			startServices: []string{"svc:foo"},
+			expected:      []string{"svc:foo"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lc := &fakeLocalServeClient{}
+			ctx := t.Context()
+			lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+				AdvertiseServicesSet: true,
+				Prefs: ipn.Prefs{
+					AdvertiseServices: tt.startServices,
+				},
+			})
+			e := &serveEnv{lc: lc, bg: bgBoolFlag{true, false}}
+			err := e.removeServiceFromPrefs(ctx, tt.svcName)
+			if err != nil {
+				t.Fatalf("removeServiceFromPrefs(%q) returned unexpected error: %v", tt.svcName, err)
+			}
+			if !slices.Equal(lc.prefs.AdvertiseServices, tt.expected) {
+				t.Errorf("removeServiceFromPrefs(%q) = %v, want %v", tt.svcName, lc.prefs.AdvertiseServices, tt.expected)
+			}
+		})
+	}
+}
+
 func TestMessageForPort(t *testing.T) {
+	svcIPMap := tailcfg.ServiceIPMappings{
+		"svc:foo": []netip.Addr{
+			netip.MustParseAddr("100.101.101.101"),
+			netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:6565:6565"),
+		},
+	}
+	svcIPMapJSON, _ := json.Marshal(svcIPMap)
+	svcIPMapJSONRawMSG := tailcfg.RawMessage(svcIPMapJSON)
+
 	tests := []struct {
 		name        string
 		subcmd      serveMode
 		serveConfig *ipn.ServeConfig
 		status      *ipnstate.Status
+		prefs       *ipn.Prefs
 		dnsName     string
 		srvType     serveType
 		srvPort     uint16
@@ -1104,7 +1403,7 @@ func TestMessageForPort(t *testing.T) {
 					"foo.test.ts.net:443": true,
 				},
 			},
-			status:  &ipnstate.Status{},
+			status:  &ipnstate.Status{CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"}},
 			dnsName: "foo.test.ts.net",
 			srvType: serveTypeHTTPS,
 			srvPort: 443,
@@ -1133,7 +1432,7 @@ func TestMessageForPort(t *testing.T) {
 					},
 				},
 			},
-			status:  &ipnstate.Status{},
+			status:  &ipnstate.Status{CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"}},
 			dnsName: "foo.test.ts.net",
 			srvType: serveTypeHTTP,
 			srvPort: 80,
@@ -1147,10 +1446,206 @@ func TestMessageForPort(t *testing.T) {
 				fmt.Sprintf(msgDisableProxy, "serve", "http", 80),
 			}, "\n"),
 		},
+		{
+			name:   "serve-service-http",
+			subcmd: serve,
+			serveConfig: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+						},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"foo.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+						},
+					},
+				},
+			},
+			status: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+				Self: &ipnstate.PeerStatus{
+					CapMap: tailcfg.NodeCapMap{
+						tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{svcIPMapJSONRawMSG},
+					},
+				},
+			},
+			prefs: &ipn.Prefs{
+				AdvertiseServices: []string{"svc:foo"},
+			},
+			dnsName: "svc:foo",
+			srvType: serveTypeHTTP,
+			srvPort: 80,
+			expected: strings.Join([]string{
+				msgServeAvailable,
+				"",
+				"http://foo.test.ts.net/",
+				"|-- proxy http://localhost:3000",
+				"",
+				fmt.Sprintf(msgRunningInBackground, "Serve"),
+				fmt.Sprintf(msgDisableServiceProxy, "svc:foo", "http", 80),
+				fmt.Sprintf(msgDisableService, "svc:foo"),
+			}, "\n"),
+		},
+		{
+			name:   "serve-service-no-capmap",
+			subcmd: serve,
+			serveConfig: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+						},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+						},
+					},
+				},
+			},
+			status: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+				Self: &ipnstate.PeerStatus{
+					CapMap: tailcfg.NodeCapMap{
+						tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{svcIPMapJSONRawMSG},
+					},
+				},
+			},
+			prefs: &ipn.Prefs{
+				AdvertiseServices: []string{"svc:bar"},
+			},
+			dnsName: "svc:bar",
+			srvType: serveTypeHTTP,
+			srvPort: 80,
+			expected: strings.Join([]string{
+				fmt.Sprintf(msgServiceWaitingApproval, "svc:bar"),
+				"",
+				"http://bar.test.ts.net/",
+				"|-- proxy http://localhost:3000",
+				"",
+				fmt.Sprintf(msgRunningInBackground, "Serve"),
+				fmt.Sprintf(msgDisableServiceProxy, "svc:bar", "http", 80),
+				fmt.Sprintf(msgDisableService, "svc:bar"),
+			}, "\n"),
+		},
+		{
+			name:   "serve-service-https-non-default-port",
+			subcmd: serve,
+			serveConfig: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							2200: {HTTPS: true},
+						},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"foo.test.ts.net:2200": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+						},
+					},
+				},
+			},
+			status: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+				Self: &ipnstate.PeerStatus{
+					CapMap: tailcfg.NodeCapMap{
+						tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{svcIPMapJSONRawMSG},
+					},
+				},
+			},
+			prefs:   &ipn.Prefs{AdvertiseServices: []string{"svc:foo"}},
+			dnsName: "svc:foo",
+			srvType: serveTypeHTTPS,
+			srvPort: 2200,
+			expected: strings.Join([]string{
+				msgServeAvailable,
+				"",
+				"https://foo.test.ts.net:2200/",
+				"|-- proxy http://localhost:3000",
+				"",
+				fmt.Sprintf(msgRunningInBackground, "Serve"),
+				fmt.Sprintf(msgDisableServiceProxy, "svc:foo", "https", 2200),
+				fmt.Sprintf(msgDisableService, "svc:foo"),
+			}, "\n"),
+		},
+		{
+			name:   "serve-service-TCPForward",
+			subcmd: serve,
+			serveConfig: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							2200: {TCPForward: "localhost:3000"},
+						},
+					},
+				},
+			},
+			status: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+				Self: &ipnstate.PeerStatus{
+					CapMap: tailcfg.NodeCapMap{
+						tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{svcIPMapJSONRawMSG},
+					},
+				},
+			},
+			prefs:   &ipn.Prefs{AdvertiseServices: []string{"svc:foo"}},
+			dnsName: "svc:foo",
+			srvType: serveTypeTCP,
+			srvPort: 2200,
+			expected: strings.Join([]string{
+				msgServeAvailable,
+				"",
+				"|-- tcp://foo.test.ts.net:2200 (TLS over TCP)",
+				"|-- tcp://100.101.101.101:2200",
+				"|-- tcp://[fd7a:115c:a1e0:ab12:4843:cd96:6565:6565]:2200",
+				"|--> tcp://localhost:3000",
+				"",
+				fmt.Sprintf(msgRunningInBackground, "Serve"),
+				fmt.Sprintf(msgDisableServiceProxy, "svc:foo", "tcp", 2200),
+				fmt.Sprintf(msgDisableService, "svc:foo"),
+			}, "\n"),
+		},
+		{
+			name:   "serve-service-Tun",
+			subcmd: serve,
+			serveConfig: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						Tun: true,
+					},
+				},
+			},
+			status: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+				Self: &ipnstate.PeerStatus{
+					CapMap: tailcfg.NodeCapMap{
+						tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{svcIPMapJSONRawMSG},
+					},
+				},
+			},
+			prefs:   &ipn.Prefs{AdvertiseServices: []string{"svc:foo"}},
+			dnsName: "svc:foo",
+			srvType: serveTypeTUN,
+			expected: strings.Join([]string{
+				msgServeAvailable,
+				"",
+				fmt.Sprintf(msgRunningTunService, "foo.test.ts.net"),
+				fmt.Sprintf(msgDisableServiceTun, "svc:foo"),
+				fmt.Sprintf(msgDisableService, "svc:foo"),
+			}, "\n"),
+		},
 	}
 
 	for _, tt := range tests {
-		e := &serveEnv{bg: true, subcmd: tt.subcmd}
+		e := &serveEnv{bg: bgBoolFlag{true, false}, subcmd: tt.subcmd}
 
 		t.Run(tt.name, func(t *testing.T) {
 			actual := e.messageForPort(tt.serveConfig, tt.status, tt.dnsName, tt.srvType, tt.srvPort)
@@ -1271,7 +1766,581 @@ func TestIsLegacyInvocation(t *testing.T) {
 			}
 
 			if gotTranslation != tt.translation {
-				t.Fatalf("expected translaction to be %q but got %q", tt.translation, gotTranslation)
+				t.Fatalf("expected translation to be %q but got %q", tt.translation, gotTranslation)
+			}
+		})
+	}
+}
+
+func TestSetServe(t *testing.T) {
+	e := &serveEnv{}
+	magicDNSSuffix := "test.ts.net"
+	tests := []struct {
+		name          string
+		desc          string
+		cfg           *ipn.ServeConfig
+		st            *ipnstate.Status
+		dnsName       string
+		srvType       serveType
+		srvPort       uint16
+		mountPath     string
+		target        string
+		allowFunnel   bool
+		proxyProtocol int
+		expected      *ipn.ServeConfig
+		expectErr     bool
+	}{
+		{
+			name:      "add-new-handler",
+			desc:      "add a new http handler to empty config",
+			cfg:       &ipn.ServeConfig{},
+			dnsName:   "foo.test.ts.net",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mountPath: "/",
+			target:    "http://localhost:3000",
+			expected: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{80: {HTTP: true}},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"foo.test.ts.net:80": {
+						Handlers: map[string]*ipn.HTTPHandler{
+							"/": {Proxy: "http://localhost:3000"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "update-http-handler",
+			desc: "update an existing http handler on the same port to same type",
+			cfg: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{80: {HTTP: true}},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"foo.test.ts.net:80": {
+						Handlers: map[string]*ipn.HTTPHandler{
+							"/": {Proxy: "http://localhost:3000"},
+						},
+					},
+				},
+			},
+			dnsName:   "foo.test.ts.net",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mountPath: "/",
+			target:    "http://localhost:3001",
+			expected: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{80: {HTTP: true}},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"foo.test.ts.net:80": {
+						Handlers: map[string]*ipn.HTTPHandler{
+							"/": {Proxy: "http://localhost:3001"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "update-TCP-handler",
+			desc: "update an existing TCP handler on the same port to a http handler",
+			cfg: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{80: {TCPForward: "http://localhost:3000"}},
+			},
+			dnsName:   "foo.test.ts.net",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mountPath: "/",
+			target:    "http://localhost:3001",
+			expectErr: true,
+		},
+		{
+			name: "add-new-service-handler",
+			desc: "add a new service TCP handler to empty config",
+			cfg:  &ipn.ServeConfig{},
+
+			dnsName: "svc:bar",
+			srvType: serveTypeTCP,
+			srvPort: 80,
+			target:  "3000",
+			expected: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{80: {TCPForward: "127.0.0.1:3000"}},
+					},
+				},
+			},
+		},
+		{
+			name: "update-service-handler",
+			desc: "update an existing service TCP handler on the same port to same type",
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{80: {TCPForward: "127.0.0.1:3000"}},
+					},
+				},
+			},
+			dnsName: "svc:bar",
+			srvType: serveTypeTCP,
+			srvPort: 80,
+			target:  "3001",
+			expected: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{80: {TCPForward: "127.0.0.1:3001"}},
+					},
+				},
+			},
+		},
+		{
+			name: "update-service-handler",
+			desc: "update an existing service TCP handler on the same port to a http handler",
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{80: {TCPForward: "127.0.0.1:3000"}},
+					},
+				},
+			},
+			dnsName:   "svc:bar",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mountPath: "/",
+			target:    "http://localhost:3001",
+			expectErr: true,
+		},
+		{
+			name:      "add-new-service-handler",
+			desc:      "add a new service HTTP handler to empty config",
+			cfg:       &ipn.ServeConfig{},
+			dnsName:   "svc:bar",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mountPath: "/",
+			target:    "http://localhost:3000",
+			expected: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{80: {HTTP: true}},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "update-existing-service-handler",
+			desc: "update an existing service HTTP handler",
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{80: {HTTP: true}},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+						},
+					},
+				},
+			},
+			dnsName:   "svc:bar",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mountPath: "/",
+			target:    "http://localhost:3001",
+			expected: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{80: {HTTP: true}},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3001"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "add-new-service-handler",
+			desc: "add a new service HTTP handler to existing service config",
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{80: {HTTP: true}},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+						},
+					},
+				},
+			},
+			dnsName:   "svc:bar",
+			srvType:   serveTypeHTTP,
+			srvPort:   88,
+			mountPath: "/",
+			target:    "http://localhost:3001",
+			expected: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+							88: {HTTP: true},
+						},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+							"bar.test.ts.net:88": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3001"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "add-new-service-mount",
+			desc: "add a new service mount to existing service config",
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{80: {HTTP: true}},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+						},
+					},
+				},
+			},
+			dnsName:   "svc:bar",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mountPath: "/added",
+			target:    "http://localhost:3001",
+			expected: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+						},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/":      {Proxy: "http://localhost:3000"},
+									"/added": {Proxy: "http://localhost:3001"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:    "add-new-service-handler",
+			desc:    "add a new service handler in tun mode to empty config",
+			cfg:     &ipn.ServeConfig{},
+			dnsName: "svc:bar",
+			srvType: serveTypeTUN,
+			expected: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						Tun: true,
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := e.setServe(tt.cfg, tt.dnsName, tt.srvType, tt.srvPort, tt.mountPath, tt.target, tt.allowFunnel, magicDNSSuffix, nil, tt.proxyProtocol)
+			if err != nil && !tt.expectErr {
+				t.Fatalf("got error: %v; did not expect error.", err)
+			}
+			if err == nil && tt.expectErr {
+				t.Fatalf("got no error; expected error.")
+			}
+			if !tt.expectErr {
+				if diff := cmp.Diff(tt.expected, tt.cfg); diff != "" {
+					// svcName := tailcfg.ServiceName(tt.dnsName)
+					t.Fatalf("got diff:\n%s", diff)
+				}
+			}
+		})
+	}
+}
+
+func TestUnsetServe(t *testing.T) {
+	tests := []struct {
+		name        string
+		desc        string
+		cfg         *ipn.ServeConfig
+		st          *ipnstate.Status
+		dnsName     string
+		srvType     serveType
+		srvPort     uint16
+		mount       string
+		setServeEnv bool
+		serveEnv    *serveEnv // if set, use this instead of the default serveEnv
+		expected    *ipn.ServeConfig
+		expectErr   bool
+	}{
+		{
+			name: "unset-http-handler",
+			desc: "remove an existing http handler",
+			cfg: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {HTTP: true},
+				},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"foo.test.ts.net:80": {
+						Handlers: map[string]*ipn.HTTPHandler{
+							"/": {Proxy: "http://localhost:3000"},
+						},
+					},
+				},
+			},
+			st: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+			},
+			dnsName:   "foo.test.ts.net",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mount:     "/",
+			expected:  &ipn.ServeConfig{},
+			expectErr: false,
+		},
+		{
+			name: "unset-service-handler",
+			desc: "remove an existing service TCP handler",
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+						},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+						},
+					},
+				},
+			},
+			st: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+			},
+			dnsName:   "svc:bar",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mount:     "/",
+			expected:  &ipn.ServeConfig{},
+			expectErr: false,
+		},
+		{
+			name: "unset-service-handler-tun",
+			desc: "remove an existing service handler in tun mode",
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						Tun: true,
+					},
+				},
+			},
+			st: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+			},
+			dnsName:   "svc:bar",
+			srvType:   serveTypeTUN,
+			expected:  &ipn.ServeConfig{},
+			expectErr: false,
+		},
+		{
+			name: "unset-service-handler-tcp",
+			desc: "remove an existing service TCP handler",
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {TCPForward: "11.11.11.11:3000"},
+						},
+					},
+				},
+			},
+			st: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+			},
+			dnsName:   "svc:bar",
+			srvType:   serveTypeTCP,
+			srvPort:   80,
+			expected:  &ipn.ServeConfig{},
+			expectErr: false,
+		},
+		{
+			name: "unset-http-handler-not-found",
+			desc: "try to remove a non-existing http handler",
+			cfg: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {HTTP: true},
+				},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"foo:80": {
+						Handlers: map[string]*ipn.HTTPHandler{
+							"/": {Proxy: "http://localhost:3000"},
+						},
+					},
+				},
+			},
+			st: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+			},
+			dnsName:   "bar.test.ts.net",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mount:     "/abc",
+			expected:  &ipn.ServeConfig{},
+			expectErr: true,
+		},
+		{
+			name: "unset-service-handler-not-found",
+			desc: "try to remove a non-existing service TCP handler",
+
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+						},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+						},
+					},
+				},
+			},
+			st: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+			},
+			dnsName:     "svc:bar",
+			srvType:     serveTypeHTTP,
+			srvPort:     80,
+			mount:       "/abc",
+			setServeEnv: true,
+			serveEnv:    &serveEnv{setPath: "/abc"},
+			expected:    &ipn.ServeConfig{},
+			expectErr:   true,
+		},
+		{
+			name: "unset-service-doesnt-exist",
+			desc: "try to remove a non-existing service's handler",
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {TCPForward: "11.11.11.11:3000"},
+						},
+					},
+				},
+			},
+			st: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+			},
+			dnsName:   "svc:foo",
+			srvType:   serveTypeTCP,
+			srvPort:   80,
+			expectErr: true,
+		},
+		{
+			name: "unset-tcp-while-port-in-use",
+			desc: "try to remove a TCP handler while the port is used for web",
+			cfg: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {HTTP: true},
+				},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"foo:80": {
+						Handlers: map[string]*ipn.HTTPHandler{
+							"/": {Proxy: "http://localhost:3000"},
+						},
+					},
+				},
+			},
+			st: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+			},
+			dnsName:   "foo.test.ts.net",
+			srvType:   serveTypeTCP,
+			srvPort:   80,
+			mount:     "/",
+			expectErr: true,
+		},
+		{
+			name: "unset-service-tcp-while-port-in-use",
+			desc: "try to remove a service TCP handler while the port is used for web",
+			cfg: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+						},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"bar.test.ts.net:80": {
+								Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Proxy: "http://localhost:3000"},
+								},
+							},
+						},
+					},
+				},
+			},
+			st: &ipnstate.Status{
+				CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+			},
+			dnsName:   "svc:bar",
+			srvType:   serveTypeTCP,
+			srvPort:   80,
+			mount:     "/",
+			expectErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := &serveEnv{}
+			if tt.setServeEnv {
+				e = tt.serveEnv
+			}
+			err := e.unsetServe(tt.cfg, tt.dnsName, tt.srvType, tt.srvPort, tt.mount, tt.st.CurrentTailnet.MagicDNSSuffix)
+			if err != nil && !tt.expectErr {
+				t.Fatalf("got error: %v; did not expect error.", err)
+			}
+			if err == nil && tt.expectErr {
+				t.Fatalf("got no error; expected error.")
+			}
+			if !tt.expectErr && !reflect.DeepEqual(tt.cfg, tt.expected) {
+				t.Fatalf("got: %v; expected: %v", tt.cfg, tt.expected)
 			}
 		})
 	}
@@ -1286,4 +2355,9 @@ func exactErrMsg(want error) func(error) string {
 		}
 		return fmt.Sprintf("\ngot:  %v\nwant: %v\n", got, want)
 	}
+}
+
+func ptrToReadOnlySlice[T any](s []T) *views.Slice[T] {
+	vs := views.SliceOf(s)
+	return &vs
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package main_test
@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -154,24 +156,24 @@ func TestBuildError(t *testing.T) {
 		t.Fatalf("writing package: %s", err)
 	}
 
-	buildErr := []byte("builderror_test.go:3:1: expected declaration, found derp\nFAIL	command-line-arguments [setup failed]")
+	wantErr := "builderror_test.go:3:1: expected declaration, found derp\nFAIL"
 
 	// Confirm `go test` exits with code 1.
 	goOut, err := exec.Command("go", "test", testfile).CombinedOutput()
 	if code, ok := errExitCode(err); !ok || code != 1 {
-		t.Fatalf("go test %s: expected error with exit code 0 but got: %v", testfile, err)
+		t.Fatalf("go test %s: got exit code %d, want 1 (err: %v)", testfile, code, err)
 	}
-	if !bytes.Contains(goOut, buildErr) {
-		t.Fatalf("go test %s: expected build error containing %q but got:\n%s", testfile, buildErr, goOut)
+	if !strings.Contains(string(goOut), wantErr) {
+		t.Fatalf("go test %s: got output %q, want output containing %q", testfile, goOut, wantErr)
 	}
 
 	// Confirm `testwrapper` exits with code 1.
 	twOut, err := cmdTestwrapper(t, testfile).CombinedOutput()
 	if code, ok := errExitCode(err); !ok || code != 1 {
-		t.Fatalf("testwrapper %s: expected error with exit code 0 but got: %v", testfile, err)
+		t.Fatalf("testwrapper %s: got exit code %d, want 1 (err: %v)", testfile, code, err)
 	}
-	if !bytes.Contains(twOut, buildErr) {
-		t.Fatalf("testwrapper %s: expected build error containing %q but got:\n%s", testfile, buildErr, twOut)
+	if !strings.Contains(string(twOut), wantErr) {
+		t.Fatalf("testwrapper %s: got output %q, want output containing %q", testfile, twOut, wantErr)
 	}
 
 	if testing.Verbose() {
@@ -213,9 +215,68 @@ func TestTimeout(t *testing.T) {
 	}
 }
 
+func TestCached(t *testing.T) {
+	t.Parallel()
+
+	// Construct our trivial package.
+	pkgDir := t.TempDir()
+	goVersion := runtime.Version()
+	goVersion = strings.TrimPrefix(goVersion, "go")
+	goVersion, _, _ = strings.Cut(goVersion, "-X:") // map 1.26.1-X:nogreenteagc to 1.26.1
+
+	goMod := fmt.Sprintf(`module example.com
+
+go %s
+`, goVersion)
+	test := `package main
+import "testing"
+
+func TestCached(t *testing.T) {}
+`
+
+	for f, c := range map[string]string{
+		"go.mod":         goMod,
+		"cached_test.go": test,
+	} {
+		err := os.WriteFile(filepath.Join(pkgDir, f), []byte(c), 0o644)
+		if err != nil {
+			t.Fatalf("writing package: %s", err)
+		}
+	}
+
+	for name, args := range map[string][]string{
+		"without_flags":     {"./..."},
+		"with_short":        {"./...", "-short"},
+		"with_coverprofile": {"./...", "-coverprofile=" + filepath.Join(t.TempDir(), "coverage.out")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var (
+				out []byte
+				err error
+			)
+			for range 2 {
+				cmd := cmdTestwrapper(t, args...)
+				cmd.Dir = pkgDir
+				out, err = cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("testwrapper ./...: expected no error but got: %v; output was:\n%s", err, out)
+				}
+			}
+
+			want := []byte("ok\texample.com\t(cached)")
+			if !bytes.Contains(out, want) {
+				t.Fatalf("wanted output containing %q but got:\n%s", want, out)
+			}
+
+			if testing.Verbose() {
+				t.Logf("success - output:\n%s", out)
+			}
+		})
+	}
+}
+
 func errExitCode(err error) (int, bool) {
-	var exit *exec.ExitError
-	if errors.As(err, &exit) {
+	if exit, ok := errors.AsType[*exec.ExitError](err); ok {
 		return exit.ExitCode(), true
 	}
 	return 0, false

@@ -1,7 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build linux || (darwin && !ios) || freebsd || openbsd
+//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
 
 package tailssh
 
@@ -48,6 +48,9 @@ func userLookup(username string) (*userMeta, error) {
 }
 
 func (u *userMeta) LoginShell() string {
+	if runtime.GOOS == "plan9" {
+		return "/bin/rc"
+	}
 	if u.loginShellCached != "" {
 		// This field should be populated on Linux, at least, because
 		// func userLookup on Linux uses "getent" to look up the user
@@ -85,6 +88,9 @@ func defaultPathForUser(u *user.User) string {
 	if s := defaultPathTmpl(); s != "" {
 		return expandDefaultPathTmpl(s, u)
 	}
+	if runtime.GOOS == "plan9" {
+		return "/bin"
+	}
 	isRoot := u.Uid == "0"
 	switch distro.Get() {
 	case distro.Debian:
@@ -98,7 +104,7 @@ func defaultPathForUser(u *user.User) string {
 		if isRoot {
 			return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 		}
-		return "/usr/local/bin:/usr/bin:/bin:/usr/bn/games"
+		return "/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"
 	case distro.NixOS:
 		return defaultPathForUserOnNixOS(u)
 	}

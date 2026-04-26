@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package shared
@@ -40,6 +40,7 @@ func TestJoin(t *testing.T) {
 		parts []string
 		want  string
 	}{
+		{[]string{}, "/"},
 		{[]string{""}, "/"},
 		{[]string{"a"}, "/a"},
 		{[]string{"/a"}, "/a"},

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package hostinfo answers questions about the host environment that Tailscale is
@@ -21,8 +21,8 @@ import (
 	"go4.org/mem"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/lazy"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/lineiter"
@@ -42,7 +42,7 @@ func RegisterHostinfoNewHook(f func(*tailcfg.Hostinfo)) {
 
 // New returns a partially populated Hostinfo for the current host.
 func New() *tailcfg.Hostinfo {
-	hostname, _ := os.Hostname()
+	hostname, _ := Hostname()
 	hostname = dnsname.FirstLabel(hostname)
 	hi := &tailcfg.Hostinfo{
 		IPNVersion:      version.Long(),
@@ -92,8 +92,8 @@ func condCall[T any](fn func() T) T {
 }
 
 var (
-	lazyInContainer = &lazyAtomicValue[opt.Bool]{f: ptr.To(inContainer)}
-	lazyGoArchVar   = &lazyAtomicValue[string]{f: ptr.To(goArchVar)}
+	lazyInContainer = &lazyAtomicValue[opt.Bool]{f: new(inContainer)}
+	lazyGoArchVar   = &lazyAtomicValue[string]{f: new(goArchVar)}
 )
 
 type lazyAtomicValue[T any] struct {
@@ -497,5 +497,32 @@ func IsNATLabGuestVM() bool {
 	return false
 }
 
-// NAT Lab VMs have a unique MAC address prefix.
-// See
+const copyV86DeviceModel = "copy-v86"
+
+var isV86Cache lazy.SyncValue[bool]
+
+// IsInVM86 reports whether we're running in the copy/v86 wasm emulator,
+// https://github.com/copy/v86/.
+func IsInVM86() bool {
+	return isV86Cache.Get(func() bool {
+		return New().DeviceModel == copyV86DeviceModel
+	})
+}
+
+type hostnameQuery func() (string, error)
+
+var hostnameFn atomic.Value // of func() (string, error)
+
+// SetHostNameFn sets a custom function for querying the system hostname.
+func SetHostnameFn(fn hostnameQuery) {
+	hostnameFn.Store(fn)
+}
+
+// Hostname returns the system hostname using the function
+// set by SetHostNameFn.  We will fallback to os.Hostname.
+func Hostname() (string, error) {
+	if fn, ok := hostnameFn.Load().(hostnameQuery); ok && fn != nil {
+		return fn()
+	}
+	return os.Hostname()
+}

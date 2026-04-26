@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package vnet simulates a virtual Internet containing a set of networks with various
@@ -30,6 +30,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,9 +52,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/waiter"
 	"tailscale.com/client/local"
-	"tailscale.com/derp"
-	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/netutil"
+	"tailscale.com/net/netx"
 	"tailscale.com/net/stun"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
@@ -87,6 +88,9 @@ func (s *Server) PopulateDERPMapIPs() error {
 		for _, n := range r.Nodes {
 			if n.IPv4 != "" {
 				s.derpIPs.Add(netip.MustParseAddr(n.IPv4))
+			}
+			if n.IPv6 != "" {
+				s.derpIPs.Add(netip.MustParseAddr(n.IPv6))
 			}
 		}
 	}
@@ -264,10 +268,13 @@ func (n *network) handleIPPacketFromGvisor(ipRaw []byte) {
 		n.logf("gvisor: serialize error: %v", err)
 		return
 	}
-	if nw, ok := n.writers.Load(node.mac); ok {
+	// Use the MAC address for this specific network (important for multi-NIC nodes
+	// where the primary MAC may be on a different network).
+	mac := node.macForNet(n)
+	if nw, ok := n.writers.Load(mac); ok {
 		nw.write(resPkt)
 	} else {
-		n.logf("gvisor write: no writeFunc for %v", node.mac)
+		n.logf("gvisor write: no writeFunc for %v (node %v on net %v)", mac, node, n.mac)
 	}
 }
 
@@ -287,6 +294,24 @@ func stringifyTEI(tei stack.TransportEndpointID) string {
 	return fmt.Sprintf("%s -> %s", remoteHostPort, localHostPort)
 }
 
+// vipNameOf returns the VIP name for the given IP, or "" if it's not a VIP.
+func vipNameOf(ip netip.Addr) string {
+	for _, v := range vips {
+		if v.Match(ip) {
+			return v.name
+		}
+	}
+	return ""
+}
+
+// nodeNameOf returns the node's name for the given IP on this network, or "" if unknown.
+func (n *network) nodeNameOf(ip netip.Addr) string {
+	if node, ok := n.nodeByIP(ip); ok {
+		return node.String()
+	}
+	return ""
+}
+
 func (n *network) acceptTCP(r *tcp.ForwarderRequest) {
 	reqDetails := r.ID()
 
@@ -298,7 +323,17 @@ func (n *network) acceptTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 
-	log.Printf("vnet-AcceptTCP: %v", stringifyTEI(reqDetails))
+	// Annotate the log with node/VIP names for readability.
+	srcHP := net.JoinHostPort(clientRemoteIP.String(), strconv.Itoa(int(reqDetails.RemotePort)))
+	srcStr := srcHP
+	if name := n.nodeNameOf(clientRemoteIP); name != "" {
+		srcStr = fmt.Sprintf("%s (%s)", srcHP, name)
+	}
+	dstStr := net.JoinHostPort(destIP.String(), strconv.Itoa(int(destPort)))
+	if name := vipNameOf(destIP); name != "" {
+		dstStr = fmt.Sprintf("%s (%s)", dstStr, name)
+	}
+	log.Printf("vnet-AcceptTCP: %s -> %s", srcStr, dstStr)
 
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
@@ -365,6 +400,22 @@ func (n *network) acceptTCP(r *tcp.ForwarderRequest) {
 		r.Complete(false)
 		tc := gonet.NewTCPConn(&wq, ep)
 		go n.serveLogCatcherConn(clientRemoteIP, tc)
+		return
+	}
+
+	if destPort == 80 && fakeCloudInit.Match(destIP) {
+		r.Complete(false)
+		tc := gonet.NewTCPConn(&wq, ep)
+		hs := &http.Server{Handler: n.s.cloudInitHandler()}
+		go hs.Serve(netutil.NewOneConnListener(tc, nil))
+		return
+	}
+
+	if destPort == 80 && fakeFiles.Match(destIP) {
+		r.Complete(false)
+		tc := gonet.NewTCPConn(&wq, ep)
+		hs := &http.Server{Handler: n.s.fileServerHandler()}
+		go hs.Serve(netutil.NewOneConnListener(tc, nil))
 		return
 	}
 
@@ -503,23 +554,24 @@ func (nw networkWriter) write(b []byte) {
 }
 
 type network struct {
-	s              *Server
-	num            int // 1-based
-	mac            MAC // of router
-	portmap        bool
-	lanInterfaceID int
-	wanInterfaceID int
-	v4             bool                 // network supports IPv4
-	v6             bool                 // network support IPv6
-	wanIP6         netip.Prefix         // router's WAN IPv6, if any, as a /64.
-	wanIP4         netip.Addr           // router's LAN IPv4, if any
-	lanIP4         netip.Prefix         // router's LAN IP + CIDR (e.g. 192.168.2.1/24)
-	breakWAN4      bool                 // break WAN IPv4 connectivity
-	latency        time.Duration        // latency applied to interface writes
-	lossRate       float64              // probability of dropping a packet (0.0 to 1.0)
-	nodesByIP4     map[netip.Addr]*node // by LAN IPv4
-	nodesByMAC     map[MAC]*node
-	logf           func(format string, args ...any)
+	s                *Server
+	num              int // 1-based
+	mac              MAC // of router
+	portmap          bool
+	lanInterfaceID   int
+	wanInterfaceID   int
+	v4               bool                 // network supports IPv4
+	v6               bool                 // network support IPv6
+	wanIP6           netip.Prefix         // router's WAN IPv6, if any, as a /64.
+	wanIP4           netip.Addr           // router's LAN IPv4, if any
+	lanIP4           netip.Prefix         // router's LAN IP + CIDR (e.g. 192.168.2.1/24)
+	breakWAN4        bool                 // break WAN IPv4 connectivity
+	blackholeControl bool                 // blackhole control connectivity
+	latency          time.Duration        // latency applied to interface writes
+	lossRate         float64              // probability of dropping a packet (0.0 to 1.0)
+	nodesByIP4       map[netip.Addr]*node // by LAN IPv4
+	nodesByMAC       map[MAC]*node
+	logf             func(format string, args ...any)
 
 	ns     *stack.Stack
 	linkEP *channel.Endpoint
@@ -569,10 +621,27 @@ func (n *network) MACOfIP(ip netip.Addr) (_ MAC, ok bool) {
 	if n.lanIP4.Addr() == ip {
 		return n.mac, true
 	}
-	if n, ok := n.nodesByIP4[ip]; ok {
-		return n.mac, true
+	if node, ok := n.nodesByIP4[ip]; ok {
+		// Use the MAC for this specific network (important for multi-NIC nodes
+		// where the primary MAC may be on a different network).
+		return node.macForNet(n), true
 	}
 	return MAC{}, false
+}
+
+// SetControlBlackholed sets whether traffic to control should be blackholed for the
+// network.
+func (n *network) SetControlBlackholed(v bool) {
+	n.blackholeControl = v
+}
+
+// nodeNIC represents a single network interface on a node.
+// For multi-homed nodes, additional NICs beyond the primary are stored in node.extraNICs.
+type nodeNIC struct {
+	mac         MAC
+	net         *network
+	lanIP       netip.Addr
+	interfaceID int
 }
 
 type node struct {
@@ -583,6 +652,8 @@ type node struct {
 	lanIP         netip.Addr // must be in net.lanIP prefix + unique in net
 	verboseSyslog bool
 
+	extraNICs []nodeNIC // secondary NICs for multi-homed nodes
+
 	// logMu guards logBuf.
 	// TODO(bradfitz): conditionally write these out to separate files at the end?
 	// Currently they only hold logcatcher logs.
@@ -591,13 +662,42 @@ type node struct {
 	logCatcherWrites int
 }
 
+// netForMAC returns the network associated with the given MAC address on this node.
+// It checks the primary NIC first, then any extra NICs.
+func (n *node) netForMAC(mac MAC) *network {
+	if mac == n.mac {
+		return n.net
+	}
+	for _, nic := range n.extraNICs {
+		if nic.mac == mac {
+			return nic.net
+		}
+	}
+	return nil
+}
+
+// macForNet returns the MAC address that this node uses on the given network.
+// For the primary network, this is node.mac. For secondary networks, it's the
+// extra NIC's MAC.
+func (n *node) macForNet(net *network) MAC {
+	if n.net == net {
+		return n.mac
+	}
+	for _, nic := range n.extraNICs {
+		if nic.net == net {
+			return nic.mac
+		}
+	}
+	return n.mac // fallback to primary
+}
+
 // String returns the string "nodeN" where N is the 1-based node number.
 func (n *node) String() string {
 	return fmt.Sprintf("node%d", n.num)
 }
 
 type derpServer struct {
-	srv       *derp.Server
+	srv       *derpserver.Server
 	handler   http.Handler
 	tlsConfig *tls.Config
 }
@@ -608,12 +708,12 @@ func newDERPServer() *derpServer {
 	ts.Close()
 
 	ds := &derpServer{
-		srv:       derp.NewServer(key.NewNode(), logger.Discard),
+		srv:       derpserver.New(key.NewNode(), logger.Discard),
 		tlsConfig: ts.TLS, // self-signed; test client configure to not check
 	}
 	var mux http.ServeMux
-	mux.Handle("/derp", derphttp.Handler(ds.srv))
-	mux.HandleFunc("/generate_204", derphttp.ServeNoContent)
+	mux.Handle("/derp", derpserver.Handler(ds.srv))
+	mux.HandleFunc("/generate_204", derpserver.ServeNoContent)
 
 	ds.handler = &mux
 	return ds
@@ -646,7 +746,11 @@ type Server struct {
 	mu              sync.Mutex
 	agentConnWaiter map[*node]chan<- struct{} // signaled after added to set
 	agentConns      set.Set[*agentConn]       //  not keyed by node; should be small/cheap enough to scan all
-	agentDialer     map[*node]DialFunc
+	agentDialer     map[*node]netx.DialFunc
+	gotFirstPacket  map[MAC]chan struct{} // closed on first packet from each MAC
+
+	cloudInitData map[int]*CloudInitData // node num → cloud-init config
+	fileContents  map[string][]byte      // filename → file bytes
 }
 
 func (s *Server) logf(format string, args ...any) {
@@ -660,8 +764,6 @@ func (s *Server) logf(format string, args ...any) {
 func (s *Server) SetLoggerForTest(logf func(format string, args ...any)) {
 	s.optLogf = logf
 }
-
-type DialFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
 var derpMap = &tailcfg.DERPMap{
 	Regions: map[int]*tailcfg.DERPRegion{
@@ -724,6 +826,10 @@ func New(c *Config) (*Server, error) {
 	if err := s.initFromConfig(c); err != nil {
 		return nil, err
 	}
+	s.gotFirstPacket = make(map[MAC]chan struct{})
+	for mac := range s.nodeByMAC {
+		s.gotFirstPacket[mac] = make(chan struct{})
+	}
 	for n := range s.networks {
 		if err := n.initStack(); err != nil {
 			return nil, fmt.Errorf("newServer: initStack: %v", err)
@@ -733,12 +839,118 @@ func New(c *Config) (*Server, error) {
 	return s, nil
 }
 
+// ControlServer returns the test control server used by this vnet.
+func (s *Server) ControlServer() *testcontrol.Server {
+	return s.control
+}
+
+// CloudInitData holds the cloud-init configuration for a node.
+type CloudInitData struct {
+	MetaData      string
+	UserData      string
+	NetworkConfig string // optional; if set, served as network-config
+}
+
+// SetCloudInitData registers cloud-init configuration for the given node number.
+// This data is served via the cloud-init.tailscale VIP when the VM boots.
+func (s *Server) SetCloudInitData(nodeNum int, data *CloudInitData) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mak.Set(&s.cloudInitData, nodeNum, data)
+}
+
+// RegisterFile registers a file to be served by the files.tailscale VIP.
+// The path is the URL path (e.g., "tta" is served at http://files.tailscale/tta).
+func (s *Server) RegisterFile(path string, data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mak.Set(&s.fileContents, path, data)
+}
+
+// cloudInitHandler returns an HTTP handler that serves cloud-init
+// meta-data and user-data for VMs that boot with
+// ds=nocloud;s=http://cloud-init.tailscale/node-N/.
+func (s *Server) cloudInitHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Parse node number from URL path like "/node-2/meta-data"
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		parts := strings.SplitN(path, "/", 2)
+		if len(parts) != 2 {
+			http.Error(w, "bad path", http.StatusNotFound)
+			return
+		}
+		nodeNum := 0
+		if _, err := fmt.Sscanf(parts[0], "node-%d", &nodeNum); err != nil {
+			http.Error(w, "bad node number", http.StatusNotFound)
+			return
+		}
+		s.mu.Lock()
+		data := s.cloudInitData[nodeNum]
+		s.mu.Unlock()
+		if data == nil {
+			http.Error(w, "no cloud-init data for node", http.StatusNotFound)
+			return
+		}
+		switch parts[1] {
+		case "meta-data":
+			w.Header().Set("Content-Type", "text/yaml")
+			io.WriteString(w, data.MetaData)
+		case "user-data":
+			w.Header().Set("Content-Type", "text/yaml")
+			io.WriteString(w, data.UserData)
+		case "network-config":
+			if data.NetworkConfig == "" {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/yaml")
+			io.WriteString(w, data.NetworkConfig)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	})
+}
+
+// fileServerHandler returns an HTTP handler that serves files registered
+// via RegisterFile. Files are served at http://files.tailscale/<path>.
+func (s *Server) fileServerHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		s.mu.Lock()
+		data, ok := s.fileContents[path]
+		s.mu.Unlock()
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.Write(data)
+	})
+}
+
 func (s *Server) Close() {
 	if shutdown := s.shuttingDown.Swap(true); !shutdown {
 		s.shutdownCancel()
 		s.pcapWriter.Close()
 	}
 	s.wg.Wait()
+}
+
+// AwaitFirstPacket waits until the first ethernet frame is received from the
+// given MAC address, indicating the VM has booted far enough to send network
+// traffic. It returns an error if the context expires first.
+func (s *Server) AwaitFirstPacket(ctx context.Context, mac MAC) error {
+	ch, ok := s.gotFirstPacket[mac]
+	if !ok {
+		return fmt.Errorf("unknown MAC %v", mac)
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("no network packets received from %v: %w", mac, ctx.Err())
+	}
 }
 
 // MACs returns the MAC addresses of the configured nodes.
@@ -897,9 +1109,21 @@ func (s *Server) ServeUnixConn(uc *net.UnixConn, proto Protocol) {
 		}
 		if !didReg[srcMAC] {
 			didReg[srcMAC] = true
+			if ch, ok := s.gotFirstPacket[srcMAC]; ok {
+				select {
+				case <-ch: // already closed
+				default:
+					close(ch)
+				}
+			}
+			srcNet := srcNode.netForMAC(srcMAC)
+			if srcNet == nil {
+				s.logf("[conn %p] node %v has no network for MAC %v", c.uc, srcNode, srcMAC)
+				continue
+			}
 			s.logf("[conn %p] Registering writer for MAC %v, node %v", c.uc, srcMAC, srcNode.lanIP)
-			srcNode.net.registerWriter(srcMAC, c)
-			defer srcNode.net.unregisterWriter(srcMAC)
+			srcNet.registerWriter(srcMAC, c)
+			defer srcNet.unregisterWriter(srcMAC)
 		}
 
 		if err := s.handleEthernetFrameFromVM(packetRaw); err != nil {
@@ -922,13 +1146,18 @@ func (s *Server) handleEthernetFrameFromVM(packetRaw []byte) error {
 		return fmt.Errorf("got frame from unknown MAC %v", srcMAC)
 	}
 
+	srcNet := srcNode.netForMAC(srcMAC)
+	if srcNet == nil {
+		return fmt.Errorf("node %v has no network for MAC %v", srcNode, srcMAC)
+	}
+
 	must.Do(s.pcapWriter.WritePacket(gopacket.CaptureInfo{
 		Timestamp:      time.Now(),
 		CaptureLength:  len(packetRaw),
 		Length:         len(packetRaw),
 		InterfaceIndex: srcNode.interfaceID,
 	}, packetRaw))
-	srcNode.net.HandleEthernetPacket(ep)
+	srcNet.HandleEthernetPacket(ep)
 	return nil
 }
 
@@ -1183,8 +1412,8 @@ func (n *network) WriteUDPPacketNoNAT(p UDPPacket) {
 	}
 
 	eth := &layers.Ethernet{
-		SrcMAC: n.mac.HWAddr(), // of gateway
-		DstMAC: node.mac.HWAddr(),
+		SrcMAC: n.mac.HWAddr(),             // of gateway; on the specific network
+		DstMAC: node.macForNet(n).HWAddr(), // use the MAC for this network
 	}
 	ethRaw, err := n.serializedUDPPacket(src, dst, p.Payload, eth)
 	if err != nil {
@@ -1262,7 +1491,8 @@ func (n *network) HandleEthernetPacketForRouter(ep EthernetPacket) {
 	}
 
 	if toForward && n.s.shouldInterceptTCP(packet) {
-		if flow.dst.Is4() && n.breakWAN4 {
+		if (flow.dst.Is4() && n.breakWAN4) ||
+			(n.blackholeControl && fakeControl.Match(flow.dst)) {
 			// Blackhole the packet.
 			return
 		}
@@ -1289,6 +1519,12 @@ func (n *network) HandleEthernetPacketForRouter(ep EthernetPacket) {
 
 	if flow.src.Is6() && flow.src.IsLinkLocalUnicast() && !flow.dst.IsLinkLocalUnicast() {
 		// Don't log.
+		return
+	}
+
+	if toForward {
+		// Traffic to destinations we don't handle (e.g. VMs trying to reach
+		// the real internet for NTP, package updates, etc). Expected; drop silently.
 		return
 	}
 
@@ -1522,11 +1758,27 @@ func (s *Server) createDHCPResponse(request gopacket.Packet) ([]byte, error) {
 		log.Printf("DHCP request from unknown node %v; ignoring", srcMAC)
 		return nil, nil
 	}
-	gwIP := node.net.lanIP4.Addr()
+	// Use the network associated with this MAC (important for multi-NIC nodes).
+	srcNet := node.netForMAC(srcMAC)
+	if srcNet == nil {
+		log.Printf("DHCP request from MAC %v with no associated network; ignoring", srcMAC)
+		return nil, nil
+	}
+	gwIP := srcNet.lanIP4.Addr()
 
-	ipLayer := request.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
 	udpLayer := request.Layer(layers.LayerTypeUDP).(*layers.UDP)
 	dhcpLayer := request.Layer(layers.LayerTypeDHCPv4).(*layers.DHCPv4)
+
+	// Determine the client's LAN IP for this specific NIC.
+	clientIP := node.lanIP
+	if srcMAC != node.mac {
+		for _, nic := range node.extraNICs {
+			if nic.mac == srcMAC {
+				clientIP = nic.lanIP
+				break
+			}
+		}
+	}
 
 	response := &layers.DHCPv4{
 		Operation:    layers.DHCPOpReply,
@@ -1535,7 +1787,7 @@ func (s *Server) createDHCPResponse(request gopacket.Packet) ([]byte, error) {
 		Xid:          dhcpLayer.Xid,
 		ClientHWAddr: dhcpLayer.ClientHWAddr,
 		Flags:        dhcpLayer.Flags,
-		YourClientIP: node.lanIP.AsSlice(),
+		YourClientIP: clientIP.AsSlice(),
 		Options: []layers.DHCPOption{
 			{
 				Type:   layers.DHCPOptServerID,
@@ -1553,11 +1805,33 @@ func (s *Server) createDHCPResponse(request gopacket.Packet) ([]byte, error) {
 	}
 	switch msgType {
 	case layers.DHCPMsgTypeDiscover:
-		response.Options = append(response.Options, layers.DHCPOption{
-			Type:   layers.DHCPOptMessageType,
-			Data:   []byte{byte(layers.DHCPMsgTypeOffer)},
-			Length: 1,
-		})
+		response.Options = append(response.Options,
+			layers.DHCPOption{
+				Type:   layers.DHCPOptMessageType,
+				Data:   []byte{byte(layers.DHCPMsgTypeOffer)},
+				Length: 1,
+			},
+			layers.DHCPOption{
+				Type:   layers.DHCPOptLeaseTime,
+				Data:   binary.BigEndian.AppendUint32(nil, 3600),
+				Length: 4,
+			},
+			layers.DHCPOption{
+				Type:   layers.DHCPOptSubnetMask,
+				Data:   net.CIDRMask(srcNet.lanIP4.Bits(), 32),
+				Length: 4,
+			},
+			layers.DHCPOption{
+				Type:   layers.DHCPOptRouter,
+				Data:   gwIP.AsSlice(),
+				Length: 4,
+			},
+			layers.DHCPOption{
+				Type:   layers.DHCPOptDNS,
+				Data:   fakeDNS.v4.AsSlice(),
+				Length: 4,
+			},
+		)
 	case layers.DHCPMsgTypeRequest:
 		response.Options = append(response.Options,
 			layers.DHCPOption{
@@ -1582,7 +1856,7 @@ func (s *Server) createDHCPResponse(request gopacket.Packet) ([]byte, error) {
 			},
 			layers.DHCPOption{
 				Type:   layers.DHCPOptSubnetMask,
-				Data:   net.CIDRMask(node.net.lanIP4.Bits(), 32),
+				Data:   net.CIDRMask(srcNet.lanIP4.Bits(), 32),
 				Length: 4,
 			},
 		)
@@ -1595,8 +1869,8 @@ func (s *Server) createDHCPResponse(request gopacket.Packet) ([]byte, error) {
 	}
 	ip := &layers.IPv4{
 		Protocol: layers.IPProtocolUDP,
-		SrcIP:    ipLayer.DstIP,
-		DstIP:    ipLayer.SrcIP,
+		SrcIP:    gwIP.AsSlice(),
+		DstIP:    net.IPv4bcast, // DHCP responses are broadcast when client has no IP yet
 	}
 	udp := &layers.UDP{
 		SrcPort: udpLayer.DstPort,
@@ -1644,7 +1918,7 @@ func (s *Server) shouldInterceptTCP(pkt gopacket.Packet) bool {
 	}
 
 	if tcp.DstPort == 80 || tcp.DstPort == 443 {
-		for _, v := range []virtualIP{fakeControl, fakeDERP1, fakeDERP2, fakeLogCatcher} {
+		for _, v := range []virtualIP{fakeControl, fakeDERP1, fakeDERP2, fakeLogCatcher, fakeCloudInit, fakeFiles} {
 			if v.Match(flow.dst) {
 				return true
 			}
@@ -1908,7 +2182,7 @@ func (n *network) doPortMap(src netip.Addr, dstLANPort, wantExtPort uint16, sec 
 		}
 	}
 
-	for try := 0; try < 20_000; try++ {
+	for range 20_000 {
 		if wanAP.Port() > 0 && !n.natTable.IsPublicPortUsed(wanAP) {
 			mak.Set(&n.portMap, wanAP, portMapping{
 				dst:    dst,
@@ -2127,7 +2401,7 @@ type NodeAgentClient struct {
 	HTTPClient *http.Client
 }
 
-func (s *Server) NodeAgentDialer(n *Node) DialFunc {
+func (s *Server) NodeAgentDialer(n *Node) netx.DialFunc {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

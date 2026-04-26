@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The wasm package builds a WebAssembly module that provides a subset of
@@ -27,6 +27,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/ipn/store/mem"
@@ -100,15 +101,18 @@ func newIPN(jsConfig js.Value) map[string]any {
 	logtail := logtail.NewLogger(c, log.Printf)
 	logf := logtail.Logf
 
-	sys := new(tsd.System)
+	sys := tsd.NewSystem()
 	sys.Set(store)
 	dialer := &tsdial.Dialer{Logf: logf}
+	dialer.SetBus(sys.Bus.Get())
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
 		Dialer:        dialer,
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
-		HealthTracker: sys.HealthTracker(),
+		HealthTracker: sys.HealthTracker.Get(),
+		ExtraRootCAs:  sys.ExtraRootCAs,
 		Metrics:       sys.UserMetricsRegistry(),
+		EventBus:      sys.Bus.Get(),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -136,7 +140,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 	sys.Tun.Get().Start()
 
 	logid := lpc.PublicID
-	srv := ipnserver.New(logf, logid, sys.NetMon.Get())
+	srv := ipnserver.New(logf, logid, sys.Bus.Get(), sys.NetMon.Get())
 	lb, err := ipnlocal.NewLocalBackend(logf, logid, sys, controlclient.LoginEphemeral)
 	if err != nil {
 		log.Fatalf("ipnlocal.NewLocalBackend: %v", err)
@@ -258,7 +262,7 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 			jsNetMap := jsNetMap{
 				Self: jsNetMapSelfNode{
 					jsNetMapNode: jsNetMapNode{
-						Name:       nm.Name,
+						Name:       nm.SelfName(),
 						Addresses:  mapSliceView(nm.GetAddresses(), func(a netip.Prefix) string { return a.Addr().String() }),
 						NodeKey:    nm.NodeKey.String(),
 						MachineKey: nm.MachineKey.String(),
@@ -336,7 +340,7 @@ func (i *jsIPN) logout() {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		i.lb.Logout(ctx)
+		i.lb.Logout(ctx, ipnauth.Self)
 	}()
 }
 
@@ -461,7 +465,6 @@ func (s *jsSSHSession) Run() {
 		cols = s.pendingResizeCols
 	}
 	err = session.RequestPty("xterm", rows, cols, ssh.TerminalModes{})
-
 	if err != nil {
 		writeError("Pseudo Terminal", err)
 		return

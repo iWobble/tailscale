@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // get-authkey allocates an authkey using an OAuth API client
@@ -16,14 +16,10 @@ import (
 	"strings"
 
 	"golang.org/x/oauth2/clientcredentials"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/internal/client/tailscale"
 )
 
 func main() {
-	// Required to use our client API. We're fine with the instability since the
-	// client lives in the same repo as this code.
-	tailscale.I_Acknowledge_This_API_Is_Unstable = true
-
 	reusable := flag.Bool("reusable", false, "allocate a reusable authkey")
 	ephemeral := flag.Bool("ephemeral", false, "allocate an ephemeral authkey")
 	preauth := flag.Bool("preauth", true, "set the authkey as pre-authorized")

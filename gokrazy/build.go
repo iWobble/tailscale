@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // This program builds the Tailscale Appliance Gokrazy image.
@@ -11,7 +11,6 @@ package main
 
 import (
 	"bytes"
-	"cmp"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -30,7 +29,6 @@ import (
 var (
 	app    = flag.String("app", "tsapp", "appliance name; one of the subdirectories of gokrazy/")
 	bucket = flag.String("bucket", "tskrazy-import", "S3 bucket to upload disk image to while making AMI")
-	goArch = flag.String("arch", cmp.Or(os.Getenv("GOARCH"), "amd64"), "GOARCH architecture to build for: arm64 or amd64")
 	build  = flag.Bool("build", false, "if true, just build locally and stop, without uploading")
 )
 
@@ -54,11 +52,44 @@ func findMkfsExt4() (string, error) {
 	return "", errors.New("No mkfs.ext4 found on system")
 }
 
+var conf gokrazyConfig
+
+// gokrazyConfig is the subset of gokrazy/internal/config.Struct
+// that we care about.
+type gokrazyConfig struct {
+	// Environment is os.Environment pairs to use when
+	// building userspace.
+	// See https://gokrazy.org/userguide/instance-config/#environment
+	Environment []string
+}
+
+func (c *gokrazyConfig) GOARCH() string {
+	for _, e := range c.Environment {
+		if v, ok := strings.CutPrefix(e, "GOARCH="); ok {
+			return v
+		}
+	}
+	return ""
+}
+
 func main() {
 	flag.Parse()
 
 	if *app == "" || strings.Contains(*app, "/") {
 		log.Fatalf("--app must be non-empty name such as 'tsapp' or 'natlabapp'")
+	}
+
+	confJSON, err := os.ReadFile(filepath.Join(*app, "config.json"))
+	if err != nil {
+		log.Fatalf("reading config.json: %v", err)
+	}
+	if err := json.Unmarshal(confJSON, &conf); err != nil {
+		log.Fatalf("unmarshaling config.json: %v", err)
+	}
+	switch conf.GOARCH() {
+	case "amd64", "arm64":
+	default:
+		log.Fatalf("config.json GOARCH %q must be amd64 or arm64", conf.GOARCH())
 	}
 
 	if err := buildImage(); err != nil {
@@ -106,26 +137,24 @@ func buildImage() error {
 	// Build the tsapp.img
 	var buf bytes.Buffer
 	cmd := exec.Command("go", "run",
-		"-exec=env GOOS=linux GOARCH="+*goArch+" ",
-		"github.com/gokrazy/tools/cmd/gok",
-		"--parent_dir="+dir,
-		"--instance="+*app,
+		"github.com/bradfitz/monogok/cmd/monogok",
 		"overwrite",
-		"--full", *app+".img",
+		"--full", filepath.Join(dir, *app+".img"),
 		"--target_storage_bytes=1258299392")
+	cmd.Dir = filepath.Join(dir, *app)
 	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return err
 	}
 
-	// gok overwrite emits a line of text saying how to run mkfs.ext4
+	// monogok overwrite emits a line of text saying how to run mkfs.ext4
 	// to create the ext4 /perm filesystem. Parse that and run it.
 	// The regexp is tight to avoid matching if the command changes,
 	// to force us to check it's still correct/safe. But it shouldn't
-	// change on its own because we pin the gok version in our go.mod.
+	// change on its own because we pin the monogok version in our go.mod.
 	//
-	// TODO(bradfitz): emit this in a machine-readable way from gok.
+	// TODO(bradfitz): emit this in a machine-readable way from monogok.
 	rx := regexp.MustCompile(`(?m)/mkfs.ext4 (-F) (-E) (offset=\d+) (\S+) (\d+)\s*?$`)
 	m := rx.FindStringSubmatch(buf.String())
 	if m == nil {
@@ -253,13 +282,13 @@ func waitForImportSnapshot(importTaskID string) (snapID string, err error) {
 
 func makeAMI(name, ebsSnapID string) (ami string, err error) {
 	var arch string
-	switch *goArch {
+	switch conf.GOARCH() {
 	case "arm64":
 		arch = "arm64"
 	case "amd64":
 		arch = "x86_64"
 	default:
-		return "", fmt.Errorf("unknown arch %q", *goArch)
+		return "", fmt.Errorf("unknown arch %q", conf.GOARCH())
 	}
 	out, err := exec.Command("aws", "ec2", "register-image",
 		"--name", name,

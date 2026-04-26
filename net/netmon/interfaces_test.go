@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netmon
@@ -13,7 +13,7 @@ import (
 )
 
 func TestGetState(t *testing.T) {
-	st, err := GetState()
+	st, err := getState("")
 	if err != nil {
 		t.Fatal(err)
 	}

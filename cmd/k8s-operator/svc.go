@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -23,6 +23,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
@@ -84,17 +85,17 @@ func childResourceLabels(name, ns, typ string) map[string]string {
 	// proxying. Instead, we have to do our own filtering and tracking with
 	// labels.
 	return map[string]string{
-		LabelManaged:         "true",
-		LabelParentName:      name,
-		LabelParentNamespace: ns,
-		LabelParentType:      typ,
+		kubetypes.LabelManaged: "true",
+		LabelParentName:        name,
+		LabelParentNamespace:   ns,
+		LabelParentType:        typ,
 	}
 }
 
 func (a *ServiceReconciler) isTailscaleService(svc *corev1.Service) bool {
 	targetIP := tailnetTargetAnnotation(svc)
 	targetFQDN := svc.Annotations[AnnotationTailnetTargetFQDN]
-	return a.shouldExpose(svc) || targetIP != "" || targetFQDN != ""
+	return shouldExpose(svc, a.isDefaultLoadBalancer) || targetIP != "" || targetFQDN != ""
 }
 
 func (a *ServiceReconciler) Reconcile(ctx context.Context, req reconcile.Request) (_ reconcile.Result, err error) {
@@ -161,11 +162,11 @@ func (a *ServiceReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 	}
 
 	proxyTyp := proxyTypeEgress
-	if a.shouldExpose(svc) {
+	if shouldExpose(svc, a.isDefaultLoadBalancer) {
 		proxyTyp = proxyTypeIngressService
 	}
 
-	if done, err := a.ssr.Cleanup(ctx, logger, childResourceLabels(svc.Name, svc.Namespace, "svc"), proxyTyp); err != nil {
+	if done, err := a.ssr.Cleanup(ctx, operatorTailnet, logger, childResourceLabels(svc.Name, svc.Namespace, "svc"), proxyTyp); err != nil {
 		return fmt.Errorf("failed to cleanup: %w", err)
 	} else if !done {
 		logger.Debugf("cleanup not done yet, waiting for next reconcile")
@@ -262,24 +263,26 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	}
 
 	sts := &tailscaleSTSConfig{
+		Replicas:            1,
 		ParentResourceName:  svc.Name,
 		ParentResourceUID:   string(svc.UID),
 		Hostname:            nameForService(svc),
 		Tags:                tags,
 		ChildResourceLabels: crl,
 		ProxyClassName:      proxyClass,
+		LoginServer:         a.ssr.loginServer,
 	}
 	sts.proxyType = proxyTypeEgress
-	if a.shouldExpose(svc) {
+	if shouldExpose(svc, a.isDefaultLoadBalancer) {
 		sts.proxyType = proxyTypeIngressService
 	}
 
 	a.mu.Lock()
-	if a.shouldExposeClusterIP(svc) {
+	if shouldExposeClusterIP(svc, a.isDefaultLoadBalancer) {
 		sts.ClusterTargetIP = svc.Spec.ClusterIP
 		a.managedIngressProxies.Add(svc.UID)
 		gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
-	} else if a.shouldExposeDNSName(svc) {
+	} else if shouldExposeDNSName(svc) {
 		sts.ClusterTargetDNSName = svc.Spec.ExternalName
 		a.managedIngressProxies.Add(svc.UID)
 		gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
@@ -328,11 +331,12 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return nil
 	}
 
-	dev, err := a.ssr.DeviceInfo(ctx, crl, logger)
+	devices, err := a.ssr.DeviceInfo(ctx, crl, logger)
 	if err != nil {
 		return fmt.Errorf("failed to get device ID: %w", err)
 	}
-	if dev == nil || dev.hostname == "" {
+
+	if len(devices) == 0 || devices[0].hostname == "" {
 		msg := "no Tailscale hostname known yet, waiting for proxy pod to finish auth"
 		logger.Debug(msg)
 		// No hostname yet. Wait for the proxy pod to auth.
@@ -341,16 +345,20 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return nil
 	}
 
+	dev := devices[0]
 	logger.Debugf("setting Service LoadBalancer status to %q, %s", dev.hostname, strings.Join(dev.ips, ", "))
+
 	ingress := []corev1.LoadBalancerIngress{
 		{Hostname: dev.hostname},
 	}
+
 	clusterIPAddr, err := netip.ParseAddr(svc.Spec.ClusterIP)
 	if err != nil {
 		msg := fmt.Sprintf("failed to parse cluster IP: %v", err)
 		tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyFailed, msg, a.clock, logger)
 		return errors.New(msg)
 	}
+
 	for _, ip := range dev.ips {
 		addr, err := netip.ParseAddr(ip)
 		if err != nil {
@@ -360,6 +368,7 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 			ingress = append(ingress, corev1.LoadBalancerIngress{IP: ip})
 		}
 	}
+
 	svc.Status.LoadBalancer.Ingress = ingress
 	tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionTrue, reasonProxyCreated, reasonProxyCreated, a.clock, logger)
 	return nil
@@ -367,6 +376,9 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 
 func validateService(svc *corev1.Service) []string {
 	violations := make([]string, 0)
+	if svc.Spec.ClusterIP == "None" {
+		violations = append(violations, "headless Services are not supported.")
+	}
 	if svc.Annotations[AnnotationTailnetTargetFQDN] != "" && svc.Annotations[AnnotationTailnetTargetIP] != "" {
 		violations = append(violations, fmt.Sprintf("only one of annotations %s and %s can be set", AnnotationTailnetTargetIP, AnnotationTailnetTargetFQDN))
 	}
@@ -392,22 +404,23 @@ func validateService(svc *corev1.Service) []string {
 			violations = append(violations, fmt.Sprintf("invalid Tailscale hostname %q, use %q annotation to override: %s", svcName, AnnotationHostname, err))
 		}
 	}
+	violations = append(violations, tagViolations(svc)...)
 	return violations
 }
 
-func (a *ServiceReconciler) shouldExpose(svc *corev1.Service) bool {
-	return a.shouldExposeClusterIP(svc) || a.shouldExposeDNSName(svc)
+func shouldExpose(svc *corev1.Service, isDefaultLoadBalancer bool) bool {
+	return shouldExposeClusterIP(svc, isDefaultLoadBalancer) || shouldExposeDNSName(svc)
 }
 
-func (a *ServiceReconciler) shouldExposeDNSName(svc *corev1.Service) bool {
+func shouldExposeDNSName(svc *corev1.Service) bool {
 	return hasExposeAnnotation(svc) && svc.Spec.Type == corev1.ServiceTypeExternalName && svc.Spec.ExternalName != ""
 }
 
-func (a *ServiceReconciler) shouldExposeClusterIP(svc *corev1.Service) bool {
-	if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
+func shouldExposeClusterIP(svc *corev1.Service, isDefaultLoadBalancer bool) bool {
+	if svc.Spec.ClusterIP == "" {
 		return false
 	}
-	return isTailscaleLoadBalancerService(svc, a.isDefaultLoadBalancer) || hasExposeAnnotation(svc)
+	return isTailscaleLoadBalancerService(svc, isDefaultLoadBalancer) || hasExposeAnnotation(svc)
 }
 
 func isTailscaleLoadBalancerService(svc *corev1.Service, isDefaultLoadBalancer bool) bool {
@@ -435,16 +448,6 @@ func tailnetTargetAnnotation(svc *corev1.Service) string {
 		return ip
 	}
 	return svc.Annotations[annotationTailnetTargetIPOld]
-}
-
-// proxyClassForObject returns the proxy class for the given object. If the
-// object does not have a proxy class label, it returns the default proxy class
-func proxyClassForObject(o client.Object, proxyDefaultClass string) string {
-	proxyClass, exists := o.GetLabels()[LabelProxyClass]
-	if !exists {
-		proxyClass = proxyDefaultClass
-	}
-	return proxyClass
 }
 
 func proxyClassIsReady(ctx context.Context, name string, cl client.Client) (bool, error) {

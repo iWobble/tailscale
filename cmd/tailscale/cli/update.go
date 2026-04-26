@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_clientupdate
 
 package cli
 
@@ -9,13 +11,24 @@ import (
 	"flag"
 	"fmt"
 	"runtime"
-	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/clientupdate"
+	"tailscale.com/util/prompt"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
+
+func init() {
+	maybeUpdateCmd = func() *ffcli.Command { return updateCmd }
+
+	clientupdateLatestTailscaleVersion.Set(func(track string) (string, error) {
+		if track == "" {
+			return clientupdate.LatestTailscaleVersion(clientupdate.CurrentTrack)
+		}
+		return clientupdate.LatestTailscaleVersion(track)
+	})
+}
 
 var updateCmd = &ffcli.Command{
 	Name:       "update",
@@ -40,7 +53,7 @@ var updateCmd = &ffcli.Command{
 			distro.Get() != distro.Synology &&
 			runtime.GOOS != "freebsd" &&
 			runtime.GOOS != "darwin" {
-			fs.StringVar(&updateArgs.track, "track", "", `which track to check for updates: "stable" or "unstable" (dev); empty means same as current`)
+			fs.StringVar(&updateArgs.track, "track", "", `which track to check for updates: "stable", "release-candidate", or "unstable" (dev); empty means same as current`)
 			fs.StringVar(&updateArgs.version, "version", "", `explicit version to update/downgrade to`)
 		}
 		return fs
@@ -87,19 +100,5 @@ func confirmUpdate(ver string) bool {
 	}
 
 	msg := fmt.Sprintf("This will update Tailscale from %v to %v. Continue?", version.Short(), ver)
-	return promptYesNo(msg)
-}
-
-// PromptYesNo takes a question and prompts the user to answer the
-// question with a yes or no. It appends a [y/n] to the message.
-func promptYesNo(msg string) bool {
-	fmt.Print(msg + " [y/n] ")
-	var resp string
-	fmt.Scanln(&resp)
-	resp = strings.ToLower(resp)
-	switch resp {
-	case "y", "yes", "sure":
-		return true
-	}
-	return false
+	return prompt.YesNo(msg, true)
 }

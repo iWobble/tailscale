@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tstest
@@ -13,6 +13,7 @@ import (
 
 	"go4.org/mem"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/testenv"
 )
 
 type testLogWriter struct {
@@ -149,7 +150,7 @@ func (ml *MemLogger) String() string {
 
 // WhileTestRunningLogger returns a logger.Logf that logs to t.Logf until the
 // test finishes, at which point it no longer logs anything.
-func WhileTestRunningLogger(t testing.TB) logger.Logf {
+func WhileTestRunningLogger(t testenv.TB) logger.Logf {
 	var (
 		mu   sync.RWMutex
 		done bool

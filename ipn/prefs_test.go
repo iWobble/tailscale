@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipn
@@ -23,11 +23,12 @@ import (
 	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
+	"tailscale.com/util/syspolicy/policyclient"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := range t.NumField() {
-		fields = append(fields, t.Field(i).Name)
+	for field := range t.Fields() {
+		fields = append(fields, field.Name)
 	}
 	return
 }
@@ -40,6 +41,7 @@ func TestPrefsEqual(t *testing.T) {
 		"RouteAll",
 		"ExitNodeID",
 		"ExitNodeIP",
+		"AutoExitNode",
 		"InternalExitNodePrior",
 		"ExitNodeAllowLANAccess",
 		"CorpDNS",
@@ -55,6 +57,7 @@ func TestPrefsEqual(t *testing.T) {
 		"Egg",
 		"AdvertiseRoutes",
 		"AdvertiseServices",
+		"Sync",
 		"NoSNAT",
 		"NoStatefulFiltering",
 		"NetfilterMode",
@@ -65,6 +68,8 @@ func TestPrefsEqual(t *testing.T) {
 		"PostureChecking",
 		"NetfilterKind",
 		"DriveShares",
+		"RelayServerPort",
+		"RelayServerStaticEndpoints",
 		"AllowSingleHosts",
 		"Persist",
 	}
@@ -73,6 +78,9 @@ func TestPrefsEqual(t *testing.T) {
 			have, prefsHandles)
 	}
 
+	relayServerPort := func(port uint16) *uint16 {
+		return &port
+	}
 	nets := func(strs ...string) (ns []netip.Prefix) {
 		for _, s := range strs {
 			n, err := netip.ParsePrefix(s)
@@ -82,6 +90,16 @@ func TestPrefsEqual(t *testing.T) {
 			ns = append(ns, n)
 		}
 		return ns
+	}
+	aps := func(strs ...string) (ret []netip.AddrPort) {
+		for _, s := range strs {
+			n, err := netip.ParseAddrPort(s)
+			if err != nil {
+				panic(err)
+			}
+			ret = append(ret, n)
+		}
+		return ret
 	}
 	tests := []struct {
 		a, b *Prefs
@@ -143,6 +161,17 @@ func TestPrefsEqual(t *testing.T) {
 		{
 			&Prefs{ExitNodeIP: netip.MustParseAddr("1.2.3.4")},
 			&Prefs{ExitNodeIP: netip.MustParseAddr("1.2.3.4")},
+			true,
+		},
+
+		{
+			&Prefs{AutoExitNode: ""},
+			&Prefs{AutoExitNode: "auto:any"},
+			false,
+		},
+		{
+			&Prefs{AutoExitNode: "auto:any"},
+			&Prefs{AutoExitNode: "auto:any"},
 			true,
 		},
 
@@ -341,6 +370,26 @@ func TestPrefsEqual(t *testing.T) {
 			&Prefs{AdvertiseServices: []string{"svc:tux", "svc:amelie"}},
 			false,
 		},
+		{
+			&Prefs{RelayServerPort: relayServerPort(0)},
+			&Prefs{RelayServerPort: nil},
+			false,
+		},
+		{
+			&Prefs{RelayServerPort: relayServerPort(0)},
+			&Prefs{RelayServerPort: relayServerPort(1)},
+			false,
+		},
+		{
+			&Prefs{RelayServerStaticEndpoints: aps("[2001:db8::1]:40000", "192.0.2.1:40000")},
+			&Prefs{RelayServerStaticEndpoints: aps("[2001:db8::1]:40000", "192.0.2.1:40000")},
+			true,
+		},
+		{
+			&Prefs{RelayServerStaticEndpoints: aps("[2001:db8::1]:40000", "192.0.2.2:40000")},
+			&Prefs{RelayServerStaticEndpoints: aps("[2001:db8::1]:40000", "192.0.2.1:40000")},
+			false,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equals(tt.b)
@@ -377,6 +426,7 @@ func checkPrefs(t *testing.T, p Prefs) {
 	if err != nil {
 		t.Fatalf("PrefsFromBytes(p2) failed: bytes=%q; err=%v\n", p2.ToBytes(), err)
 	}
+	p2b.normalizeOptBools()
 	p2p := p2.Pretty()
 	p2bp := p2b.Pretty()
 	t.Logf("\np2p:  %#v\np2bp: %#v\n", p2p, p2bp)
@@ -389,6 +439,42 @@ func checkPrefs(t *testing.T, p Prefs) {
 	p2c = p2.Clone()
 	if !p2b.Equals(p2c) {
 		t.Fatalf("p2b != p2c\n")
+	}
+}
+
+// PrefsFromBytes documents that it preserves fields unset in the JSON.
+// This verifies that stays true.
+func TestPrefsFromBytesPreservesOldValues(t *testing.T) {
+	tests := []struct {
+		name string
+		old  Prefs
+		json []byte
+		want Prefs
+	}{
+		{
+			name: "preserve-control-url",
+			old:  Prefs{ControlURL: "https://foo"},
+			json: []byte(`{"RouteAll": true}`),
+			want: Prefs{ControlURL: "https://foo", RouteAll: true},
+		},
+		{
+			name: "opt-Bool", // test that we don't normalize it early
+			old:  Prefs{Sync: "unset"},
+			json: []byte(`{}`),
+			want: Prefs{Sync: "unset"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			old := tt.old // shallow
+			err := PrefsFromBytes(tt.json, &old)
+			if err != nil {
+				t.Fatalf("PrefsFromBytes failed: %v", err)
+			}
+			if !old.Equals(&tt.want) {
+				t.Fatalf("got %+v; want %+v", old, tt.want)
+			}
+		})
 	}
 }
 
@@ -474,7 +560,7 @@ func TestPrefsPretty(t *testing.T) {
 				},
 			},
 			"linux",
-			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist{o=, n=[B1VKl] u=""}}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist{o=, n=[B1VKl] u="" ak=-}}`,
 		},
 		{
 			Prefs{
@@ -563,6 +649,11 @@ func TestPrefsPretty(t *testing.T) {
 			},
 			"linux",
 			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist=nil}`,
+		},
+		{
+			Prefs{Sync: "false"},
+			"linux",
+			"Prefs{ra=false dns=false want=false sync=false routes=[] nf=off update=off Persist=nil}",
 		},
 	}
 	for i, tt := range tests {
@@ -871,6 +962,23 @@ func TestExitNodeIPOfArg(t *testing.T) {
 			wantErr: `no node found in netmap with IP 1.2.3.4`,
 		},
 		{
+			name: "ip_is_self",
+			arg:  "1.2.3.4",
+			st: &ipnstate.Status{
+				TailscaleIPs: []netip.Addr{mustIP("1.2.3.4")},
+			},
+			wantErr: "cannot use 1.2.3.4 as an exit node as it is a local IP address to this machine",
+		},
+		{
+			name: "ip_is_self_when_backend_running",
+			arg:  "1.2.3.4",
+			st: &ipnstate.Status{
+				BackendState: "Running",
+				TailscaleIPs: []netip.Addr{mustIP("1.2.3.4")},
+			},
+			wantErr: "cannot use 1.2.3.4 as an exit node as it is a local IP address to this machine",
+		},
+		{
 			name: "ip_not_exit",
 			arg:  "1.2.3.4",
 			st: &ipnstate.Status{
@@ -901,7 +1009,7 @@ func TestExitNodeIPOfArg(t *testing.T) {
 			name:    "no_match",
 			arg:     "unknown",
 			st:      &ipnstate.Status{MagicDNSSuffix: ".foo"},
-			wantErr: `invalid value "unknown" for --exit-node; must be IP or unique node name`,
+			wantErr: `invalid value "unknown" for --exit-node; must be IP or hostname`,
 		},
 		{
 			name: "name",
@@ -921,6 +1029,21 @@ func TestExitNodeIPOfArg(t *testing.T) {
 		{
 			name: "name_fqdn",
 			arg:  "skippy.foo.",
+			st: &ipnstate.Status{
+				MagicDNSSuffix: ".foo",
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {
+						DNSName:        "skippy.foo.",
+						TailscaleIPs:   []netip.Addr{mustIP("1.0.0.2")},
+						ExitNodeOption: true,
+					},
+				},
+			},
+			want: mustIP("1.0.0.2"),
+		},
+		{
+			name: "name_fqdn_sans_dot",
+			arg:  "skippy.foo",
 			st: &ipnstate.Status{
 				MagicDNSSuffix: ".foo",
 				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
@@ -959,7 +1082,7 @@ func TestExitNodeIPOfArg(t *testing.T) {
 					},
 				},
 			},
-			wantErr: `invalid value "skippy.bar." for --exit-node; must be IP or unique node name`,
+			wantErr: `invalid value "skippy.bar." for --exit-node; must be IP or hostname`,
 		},
 		{
 			name: "ambiguous",
@@ -1006,15 +1129,16 @@ func TestExitNodeIPOfArg(t *testing.T) {
 
 func TestControlURLOrDefault(t *testing.T) {
 	var p Prefs
-	if got, want := p.ControlURLOrDefault(), DefaultControlURL; got != want {
+	polc := policyclient.NoPolicyClient{}
+	if got, want := p.ControlURLOrDefault(polc), DefaultControlURL; got != want {
 		t.Errorf("got %q; want %q", got, want)
 	}
 	p.ControlURL = "http://foo.bar"
-	if got, want := p.ControlURLOrDefault(), "http://foo.bar"; got != want {
+	if got, want := p.ControlURLOrDefault(polc), "http://foo.bar"; got != want {
 		t.Errorf("got %q; want %q", got, want)
 	}
 	p.ControlURL = "https://login.tailscale.com"
-	if got, want := p.ControlURLOrDefault(), DefaultControlURL; got != want {
+	if got, want := p.ControlURLOrDefault(polc), DefaultControlURL; got != want {
 		t.Errorf("got %q; want %q", got, want)
 	}
 }
@@ -1101,5 +1225,64 @@ func TestPrefsDowngrade(t *testing.T) {
 	}
 	if !op.AllowSingleHosts {
 		t.Fatal("AllowSingleHosts should be true")
+	}
+}
+
+func TestParseAutoExitNodeString(t *testing.T) {
+	tests := []struct {
+		name       string
+		exitNodeID string
+		wantOk     bool
+		wantExpr   ExitNodeExpression
+	}{
+		{
+			name:       "empty-expr",
+			exitNodeID: "",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+		{
+			name:       "no-auto-prefix",
+			exitNodeID: "foo",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+		{
+			name:       "auto:any",
+			exitNodeID: "auto:any",
+			wantOk:     true,
+			wantExpr:   AnyExitNode,
+		},
+		{
+			name:       "auto:foo",
+			exitNodeID: "auto:foo",
+			wantOk:     true,
+			wantExpr:   "foo",
+		},
+		{
+			name:       "auto-prefix-empty-suffix",
+			exitNodeID: "auto:",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+		{
+			name:       "auto-prefix-no-colon",
+			exitNodeID: "auto",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotExpr, gotOk := ParseAutoExitNodeString(tt.exitNodeID)
+			if gotOk != tt.wantOk || gotExpr != tt.wantExpr {
+				if tt.wantOk {
+					t.Fatalf("got %v (%q); want %v (%q)", gotOk, gotExpr, tt.wantOk, tt.wantExpr)
+				} else {
+					t.Fatalf("got %v (%q); want false", gotOk, gotExpr)
+				}
+			}
+		})
 	}
 }

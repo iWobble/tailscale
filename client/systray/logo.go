@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build cgo || !darwin
@@ -11,10 +11,12 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"runtime"
 	"sync"
 	"time"
 
 	"fyne.io/systray"
+	ico "github.com/Kodeworks/golang-image-ico"
 	"github.com/fogleman/gg"
 )
 
@@ -231,8 +233,8 @@ func (logo tsLogo) renderWithBorder(borderUnits int) *bytes.Buffer {
 		dc.InvertMask()
 	}
 
-	for y := 0; y < 3; y++ {
-		for x := 0; x < 3; x++ {
+	for y := range 3 {
+		for x := range 3 {
 			px := (borderUnits + 1 + 3*x) * radius
 			py := (borderUnits + 1 + 3*y) * radius
 			col := fg
@@ -251,7 +253,13 @@ func (logo tsLogo) renderWithBorder(borderUnits int) *bytes.Buffer {
 	}
 
 	b := bytes.NewBuffer(nil)
-	png.Encode(b, dc.Image())
+
+	// Encode as ICO format on Windows, PNG on all other platforms.
+	if runtime.GOOS == "windows" {
+		_ = ico.Encode(b, dc.Image())
+	} else {
+		_ = png.Encode(b, dc.Image())
+	}
 	return b
 }
 

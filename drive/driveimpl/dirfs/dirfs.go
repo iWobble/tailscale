@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package dirfs provides a webdav.FileSystem that looks like a read-only
@@ -44,7 +44,7 @@ func (c *Child) isAvailable() bool {
 // Any attempts to perform operations on paths inside of children will result
 // in a panic, as these are not expected to be performed on this FS.
 //
-// An FS an optionally have a StaticRoot, which will insert a folder with that
+// An FS can optionally have a StaticRoot, which will insert a folder with that
 // StaticRoot into the tree, like this:
 //
 // -- <StaticRoot>

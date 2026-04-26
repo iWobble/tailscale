@@ -1,16 +1,16 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
 import (
+	"flag"
 	"net/netip"
 	"reflect"
 	"testing"
 
 	"tailscale.com/ipn"
 	"tailscale.com/net/tsaddr"
-	"tailscale.com/types/ptr"
 )
 
 func TestCalcAdvertiseRoutesForSet(t *testing.T) {
@@ -27,80 +27,80 @@ func TestCalcAdvertiseRoutesForSet(t *testing.T) {
 		},
 		{
 			name:    "advertise-exit",
-			setExit: ptr.To(true),
+			setExit: new(true),
 			want:    tsaddr.ExitRoutes(),
 		},
 		{
 			name:    "advertise-exit/already-routes",
 			was:     []netip.Prefix{pfx("34.0.0.0/16")},
-			setExit: ptr.To(true),
+			setExit: new(true),
 			want:    []netip.Prefix{pfx("34.0.0.0/16"), tsaddr.AllIPv4(), tsaddr.AllIPv6()},
 		},
 		{
 			name:    "advertise-exit/already-exit",
 			was:     tsaddr.ExitRoutes(),
-			setExit: ptr.To(true),
+			setExit: new(true),
 			want:    tsaddr.ExitRoutes(),
 		},
 		{
 			name:    "stop-advertise-exit",
 			was:     tsaddr.ExitRoutes(),
-			setExit: ptr.To(false),
+			setExit: new(false),
 			want:    nil,
 		},
 		{
 			name:    "stop-advertise-exit/with-routes",
 			was:     []netip.Prefix{pfx("34.0.0.0/16"), tsaddr.AllIPv4(), tsaddr.AllIPv6()},
-			setExit: ptr.To(false),
+			setExit: new(false),
 			want:    []netip.Prefix{pfx("34.0.0.0/16")},
 		},
 		{
 			name:      "advertise-routes",
-			setRoutes: ptr.To("10.0.0.0/24,192.168.0.0/16"),
+			setRoutes: new("10.0.0.0/24,192.168.0.0/16"),
 			want:      []netip.Prefix{pfx("10.0.0.0/24"), pfx("192.168.0.0/16")},
 		},
 		{
 			name:      "advertise-routes/already-exit",
 			was:       tsaddr.ExitRoutes(),
-			setRoutes: ptr.To("10.0.0.0/24,192.168.0.0/16"),
+			setRoutes: new("10.0.0.0/24,192.168.0.0/16"),
 			want:      []netip.Prefix{pfx("10.0.0.0/24"), pfx("192.168.0.0/16"), tsaddr.AllIPv4(), tsaddr.AllIPv6()},
 		},
 		{
 			name:      "advertise-routes/already-diff-routes",
 			was:       []netip.Prefix{pfx("34.0.0.0/16")},
-			setRoutes: ptr.To("10.0.0.0/24,192.168.0.0/16"),
+			setRoutes: new("10.0.0.0/24,192.168.0.0/16"),
 			want:      []netip.Prefix{pfx("10.0.0.0/24"), pfx("192.168.0.0/16")},
 		},
 		{
 			name:      "stop-advertise-routes",
 			was:       []netip.Prefix{pfx("34.0.0.0/16")},
-			setRoutes: ptr.To(""),
+			setRoutes: new(""),
 			want:      nil,
 		},
 		{
 			name:      "stop-advertise-routes/already-exit",
 			was:       []netip.Prefix{pfx("34.0.0.0/16"), tsaddr.AllIPv4(), tsaddr.AllIPv6()},
-			setRoutes: ptr.To(""),
+			setRoutes: new(""),
 			want:      tsaddr.ExitRoutes(),
 		},
 		{
 			name:      "advertise-routes-and-exit",
-			setExit:   ptr.To(true),
-			setRoutes: ptr.To("10.0.0.0/24,192.168.0.0/16"),
+			setExit:   new(true),
+			setRoutes: new("10.0.0.0/24,192.168.0.0/16"),
 			want:      []netip.Prefix{pfx("10.0.0.0/24"), pfx("192.168.0.0/16"), tsaddr.AllIPv4(), tsaddr.AllIPv6()},
 		},
 		{
 			name:      "advertise-routes-and-exit/already-exit",
 			was:       tsaddr.ExitRoutes(),
-			setExit:   ptr.To(true),
-			setRoutes: ptr.To("10.0.0.0/24,192.168.0.0/16"),
+			setExit:   new(true),
+			setRoutes: new("10.0.0.0/24,192.168.0.0/16"),
 			want:      []netip.Prefix{pfx("10.0.0.0/24"), pfx("192.168.0.0/16"), tsaddr.AllIPv4(), tsaddr.AllIPv6()},
 		},
 		{
 			name:      "advertise-routes-and-exit/already-routes",
 			was:       []netip.Prefix{pfx("10.0.0.0/24"), pfx("192.168.0.0/16")},
-			setExit:   ptr.To(true),
-			setRoutes: ptr.To("10.0.0.0/24,192.168.0.0/16"),
+			setExit:   new(true),
+			setRoutes: new("10.0.0.0/24,192.168.0.0/16"),
 			want:      []netip.Prefix{pfx("10.0.0.0/24"), pfx("192.168.0.0/16"), tsaddr.AllIPv4(), tsaddr.AllIPv6()},
 		},
 	}
@@ -128,4 +128,25 @@ func TestCalcAdvertiseRoutesForSet(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSetDefaultsMatchUpDefaults is meant to ensure that the default values
+// for `tailscale set` and `tailscale up` are the same.
+// Since `tailscale set` only sets preferences that are explicitly mentioned,
+// the default values for its flags are only used for `--help` documentation.
+func TestSetDefaultsMatchUpDefaults(t *testing.T) {
+	upFlagSet.VisitAll(func(up *flag.Flag) {
+		if preflessFlag(up.Name) {
+			return
+		}
+
+		set := setFlagSet.Lookup(up.Name)
+		if set == nil {
+			return
+		}
+
+		if set.DefValue != up.DefValue {
+			t.Errorf("--%s: set defaults to %q, but up defaults to %q", up.Name, set.DefValue, up.DefValue)
+		}
+	})
 }

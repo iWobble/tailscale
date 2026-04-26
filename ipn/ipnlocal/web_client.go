@@ -1,7 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !ios && !android
+//go:build !ios && !android && !ts_omit_webclient
 
 package ipnlocal
 
@@ -19,14 +19,15 @@ import (
 
 	"tailscale.com/client/local"
 	"tailscale.com/client/web"
-	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsconst"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/backoff"
 	"tailscale.com/util/mak"
 )
 
-const webClientPort = web.ListenPort
+const webClientPort = tsconst.WebListenPort
 
 // webClient holds state for the web interface for managing this
 // tailscale instance. The web interface is not used by default,
@@ -116,11 +117,12 @@ func (b *LocalBackend) handleWebClientConn(c net.Conn) error {
 // for each of the local device's Tailscale IP addresses. This is needed to properly
 // route local traffic when using kernel networking mode.
 func (b *LocalBackend) updateWebClientListenersLocked() {
-	if b.netMap == nil {
+	nm := b.currentNode().NetMap()
+	if nm == nil {
 		return
 	}
 
-	addrs := b.netMap.GetAddresses()
+	addrs := nm.GetAddresses()
 	for _, pfx := range addrs.All() {
 		addrPort := netip.AddrPortFrom(pfx.Addr(), webClientPort)
 		if _, ok := b.webClientListeners[addrPort]; ok {

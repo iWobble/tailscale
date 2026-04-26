@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netmon
@@ -13,7 +13,14 @@ import (
 	"golang.org/x/sys/unix"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/eventbus"
 )
+
+func init() {
+	IsInterestingInterface = func(iface Interface, prefixes []netip.Prefix) bool {
+		return isInterestingInterface(iface.Name)
+	}
+}
 
 const debugRouteMessages = false
 
@@ -24,7 +31,7 @@ type unspecifiedMessage struct{}
 
 func (unspecifiedMessage) ignore() bool { return false }
 
-func newOSMon(logf logger.Logf, _ *Monitor) (osMon, error) {
+func newOSMon(_ *eventbus.Bus, logf logger.Logf, _ *Monitor) (osMon, error) {
 	fd, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, 0)
 	if err != nil {
 		return nil, err
@@ -124,11 +131,10 @@ func addrType(addrs []route.Addr, rtaxType int) route.Addr {
 	return nil
 }
 
-func (m *darwinRouteMon) IsInterestingInterface(iface string) bool {
+func isInterestingInterface(iface string) bool {
 	baseName := strings.TrimRight(iface, "0123456789")
 	switch baseName {
-	// TODO(maisem): figure out what this list should actually be.
-	case "llw", "awdl", "ipsec":
+	case "llw", "awdl", "ipsec", "gif", "XHC", "anpi", "lo", "utun":
 		return false
 	}
 	return true
@@ -136,7 +142,7 @@ func (m *darwinRouteMon) IsInterestingInterface(iface string) bool {
 
 func (m *darwinRouteMon) skipInterfaceAddrMessage(msg *route.InterfaceAddrMessage) bool {
 	if la, ok := addrType(msg.Addrs, unix.RTAX_IFP).(*route.LinkAddr); ok {
-		if !m.IsInterestingInterface(la.Name) {
+		if !isInterestingInterface(la.Name) {
 			return true
 		}
 	}
@@ -148,6 +154,14 @@ func (m *darwinRouteMon) skipRouteMessage(msg *route.RouteMessage) bool {
 		// Skip those like:
 		// dst = fe80::b476:66ff:fe30:c8f6%15
 		return true
+	}
+
+	// We can skip route messages from uninteresting interfaces.  We do this upstream
+	// against the InterfaceMonitor, but skipping them here avoids unnecessary work.
+	if la, ok := addrType(msg.Addrs, unix.RTAX_IFP).(*route.LinkAddr); ok {
+		if !isInterestingInterface(la.Name) {
+			return true
+		}
 	}
 	return false
 }

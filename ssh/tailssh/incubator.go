@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // This file contains the code for the incubator process.  Tailscaled
@@ -7,16 +7,18 @@
 // and groups to the specified `--uid`, `--gid` and `--groups`, and
 // then launches the requested `--cmd`.
 
-//go:build linux || (darwin && !ios) || freebsd || openbsd
+//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
 
 package tailssh
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"log/syslog"
 	"os"
@@ -29,16 +31,17 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/pkg/sftp"
+	gliderssh "github.com/tailscale/gliderssh"
 	"github.com/u-root/u-root/pkg/termios"
-	gossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
 	"tailscale.com/cmd/tailscaled/childproc"
 	"tailscale.com/hostinfo"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/types/logger"
 	"tailscale.com/version/distro"
 )
@@ -48,6 +51,7 @@ const (
 	darwin  = "darwin"
 	freebsd = "freebsd"
 	openbsd = "openbsd"
+	windows = "windows"
 )
 
 func init() {
@@ -70,16 +74,50 @@ var maybeStartLoginSession = func(dlogf logger.Logf, ia incubatorArgs) (close fu
 	return nil
 }
 
+// truePaths are the common locations to find the true binary, in likelihood order.
+var truePaths = [...]string{"/usr/bin/true", "/bin/true"}
+
+// tryExecInDir tries to run a command in dir and returns nil if it succeeds.
+// Otherwise, it returns a filesystem error or a timeout error if the command
+// took too long.
+func tryExecInDir(ctx context.Context, dir string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	run := func(path string) error {
+		cmd := exec.CommandContext(ctx, path)
+		cmd.Dir = dir
+		return cmd.Run()
+	}
+
+	// Assume that the following executables exist, are executable, and
+	// immediately return.
+	if runtime.GOOS == windows {
+		windir := os.Getenv("windir")
+		return run(filepath.Join(windir, "system32", "doskey.exe"))
+	}
+	// Execute the first "true" we find in the list.
+	for _, path := range truePaths {
+		// Note: LookPath does not consult $PATH when passed multi-label paths.
+		if p, err := exec.LookPath(path); err == nil {
+			return run(p)
+		}
+	}
+	return exec.ErrNotFound
+}
+
 // newIncubatorCommand returns a new exec.Cmd configured with
 // `tailscaled be-child ssh` as the entrypoint.
 //
-// If ss.srv.tailscaledPath is empty, this method is equivalent to
-// exec.CommandContext.
+// If ss.srv.tailscaledPath is empty, this method is almost equivalent to
+// exec.CommandContext. It will refuse to run in SFTP-mode. It will simulate the
+// behavior of SSHD when by falling back to the root directory if it cannot run
+// a command in the user’s home directory.
 //
 // The returned Cmd.Env is guaranteed to be nil; the caller populates it.
 func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, err error) {
 	defer func() {
-		if cmd.Env != nil {
+		if cmd != nil && cmd.Env != nil {
 			panic("internal error")
 		}
 	}()
@@ -104,7 +142,34 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, err 
 		loginShell := ss.conn.localUser.LoginShell()
 		args := shellArgs(isShell, ss.RawCommand())
 		logf("directly running %s %q", loginShell, args)
-		return exec.CommandContext(ss.ctx, loginShell, args...), nil
+		cmd = exec.CommandContext(ss.ctx, loginShell, args...)
+
+		// While running directly instead of using `tailscaled be-child`,
+		// do what sshd does by running inside the home directory,
+		// falling back to the root directory it doesn't have permissions.
+		// This can happen if the system has networked home directories,
+		// i.e. NFS or SMB, which enable root-squashing by default.
+		cmd.Dir = ss.conn.localUser.HomeDir
+		err := tryExecInDir(ss.ctx, cmd.Dir)
+		switch {
+		case errors.Is(err, exec.ErrNotFound):
+			// /bin/true might not be installed on a barebones system,
+			// so we assume that the home directory does not exist.
+			cmd.Dir = "/"
+		case errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist):
+			// Ensure that cmd.Dir is the source of the error.
+			if pathErr, ok := errors.AsType[*fs.PathError](err); ok && pathErr.Path == cmd.Dir {
+				// If we cannot run loginShell in localUser.HomeDir,
+				// we will try to run this command in the root directory.
+				cmd.Dir = "/"
+			} else {
+				return nil, err
+			}
+		case err != nil:
+			return nil, err
+		}
+
+		return cmd, nil
 	}
 
 	lu := ss.conn.localUser
@@ -178,7 +243,10 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, err 
 		}
 	}
 
-	return exec.CommandContext(ss.ctx, ss.conn.srv.tailscaledPath, incubatorArgs...), nil
+	cmd = exec.CommandContext(ss.ctx, ss.conn.srv.tailscaledPath, incubatorArgs...)
+	// The incubator will chdir into the home directory after it drops privileges.
+	cmd.Dir = "/"
+	return cmd, nil
 }
 
 var debugIncubator bool
@@ -243,7 +311,7 @@ func parseIncubatorArgs(args []string) (incubatorArgs, error) {
 	flags.StringVar(&ia.encodedEnv, "encoded-env", "", "JSON encoded array of environment variables in '['key=value']' format")
 	flags.Parse(args)
 
-	for _, g := range strings.Split(groups, ",") {
+	for g := range strings.SplitSeq(groups, ",") {
 		gid, err := strconv.Atoi(g)
 		if err != nil {
 			return ia, fmt.Errorf("unable to parse group id %q: %w", g, err)
@@ -254,32 +322,44 @@ func parseIncubatorArgs(args []string) (incubatorArgs, error) {
 	return ia, nil
 }
 
-func (ia incubatorArgs) forwadedEnviron() ([]string, string, error) {
+// forwardedEnviron returns the concatenation of the current environment with
+// any environment variables specified in ia.encodedEnv.
+//
+// It also returns allowedExtraKeys, containing the env keys that were passed in
+// to ia.encodedEnv.
+func (ia incubatorArgs) forwardedEnviron() (env, allowedExtraKeys []string, err error) {
 	environ := os.Environ()
+
 	// pass through SSH_AUTH_SOCK environment variable to support ssh agent forwarding
-	allowListKeys := "SSH_AUTH_SOCK"
+	// TODO(bradfitz,percy): why is this listed specially? If the parent wanted to included
+	// it, couldn't it have just passed it to the incubator in encodedEnv?
+	// If it didn't, no reason for us to pass it to "su -w ..." if it's not in our env
+	// anyway? (Surely we don't want to inherit the tailscaled parent SSH_AUTH_SOCK, if any)
+	allowedExtraKeys = []string{"SSH_AUTH_SOCK"}
 
 	if ia.encodedEnv != "" {
 		unquoted, err := strconv.Unquote(ia.encodedEnv)
 		if err != nil {
-			return nil, "", fmt.Errorf("unable to parse encodedEnv %q: %w", ia.encodedEnv, err)
+			return nil, nil, fmt.Errorf("unable to parse encodedEnv %q: %w", ia.encodedEnv, err)
 		}
 
 		var extraEnviron []string
 
 		err = json.Unmarshal([]byte(unquoted), &extraEnviron)
 		if err != nil {
-			return nil, "", fmt.Errorf("unable to parse encodedEnv %q: %w", ia.encodedEnv, err)
+			return nil, nil, fmt.Errorf("unable to parse encodedEnv %q: %w", ia.encodedEnv, err)
 		}
 
 		environ = append(environ, extraEnviron...)
 
-		for _, v := range extraEnviron {
-			allowListKeys = fmt.Sprintf("%s,%s", allowListKeys, strings.Split(v, "=")[0])
+		for _, kv := range extraEnviron {
+			if k, _, ok := strings.Cut(kv, "="); ok {
+				allowedExtraKeys = append(allowedExtraKeys, k)
+			}
 		}
 	}
 
-	return environ, allowListKeys, nil
+	return environ, allowedExtraKeys, nil
 }
 
 // beIncubator is the entrypoint to the `tailscaled be-child ssh` subcommand.
@@ -459,7 +539,7 @@ func tryExecLogin(dlogf logger.Logf, ia incubatorArgs) error {
 	loginArgs := ia.loginArgs(loginCmdPath)
 	dlogf("logging in with %+v", loginArgs)
 
-	environ, _, err := ia.forwadedEnviron()
+	environ, _, err := ia.forwardedEnviron()
 	if err != nil {
 		return err
 	}
@@ -498,14 +578,14 @@ func trySU(dlogf logger.Logf, ia incubatorArgs) (handled bool, err error) {
 		defer sessionCloser()
 	}
 
-	environ, allowListEnvKeys, err := ia.forwadedEnviron()
+	environ, allowListEnvKeys, err := ia.forwardedEnviron()
 	if err != nil {
 		return false, err
 	}
 
 	loginArgs := []string{
 		su,
-		"-w", allowListEnvKeys,
+		"-w", strings.Join(allowListEnvKeys, ","),
 		"-l",
 		ia.localUser,
 	}
@@ -546,7 +626,7 @@ func findSU(dlogf logger.Logf, ia incubatorArgs) string {
 		return ""
 	}
 
-	_, allowListEnvKeys, err := ia.forwadedEnviron()
+	_, allowListEnvKeys, err := ia.forwardedEnviron()
 	if err != nil {
 		return ""
 	}
@@ -555,7 +635,7 @@ func findSU(dlogf logger.Logf, ia incubatorArgs) string {
 	// to make sure su supports the necessary arguments.
 	err = exec.Command(
 		su,
-		"-w", allowListEnvKeys,
+		"-w", strings.Join(allowListEnvKeys, ","),
 		"-l",
 		ia.localUser,
 		"-c", "true",
@@ -582,7 +662,7 @@ func handleSSHInProcess(dlogf logger.Logf, ia incubatorArgs) error {
 		return err
 	}
 
-	environ, _, err := ia.forwadedEnviron()
+	environ, _, err := ia.forwardedEnviron()
 	if err != nil {
 		return err
 	}
@@ -765,7 +845,6 @@ func (ss *sshSession) launchProcess() error {
 	}
 
 	cmd := ss.cmd
-	cmd.Dir = "/"
 	cmd.Env = envForUser(ss.conn.localUser)
 	for _, kv := range ss.Environ() {
 		if acceptEnvPair(kv) {
@@ -818,7 +897,7 @@ func (ss *sshSession) launchProcess() error {
 	return nil
 }
 
-func resizeWindow(fd int, winCh <-chan ssh.Window) {
+func resizeWindow(fd int, winCh <-chan gliderssh.Window) {
 	for win := range winCh {
 		unix.IoctlSetWinsize(fd, syscall.TIOCSWINSZ, &unix.Winsize{
 			Row:    uint16(win.Height),
@@ -833,62 +912,62 @@ func resizeWindow(fd int, winCh <-chan ssh.Window) {
 // to mnemonic names expected by the termios package.
 // These are meant to be platform independent.
 var opcodeShortName = map[uint8]string{
-	gossh.VINTR:         "intr",
-	gossh.VQUIT:         "quit",
-	gossh.VERASE:        "erase",
-	gossh.VKILL:         "kill",
-	gossh.VEOF:          "eof",
-	gossh.VEOL:          "eol",
-	gossh.VEOL2:         "eol2",
-	gossh.VSTART:        "start",
-	gossh.VSTOP:         "stop",
-	gossh.VSUSP:         "susp",
-	gossh.VDSUSP:        "dsusp",
-	gossh.VREPRINT:      "rprnt",
-	gossh.VWERASE:       "werase",
-	gossh.VLNEXT:        "lnext",
-	gossh.VFLUSH:        "flush",
-	gossh.VSWTCH:        "swtch",
-	gossh.VSTATUS:       "status",
-	gossh.VDISCARD:      "discard",
-	gossh.IGNPAR:        "ignpar",
-	gossh.PARMRK:        "parmrk",
-	gossh.INPCK:         "inpck",
-	gossh.ISTRIP:        "istrip",
-	gossh.INLCR:         "inlcr",
-	gossh.IGNCR:         "igncr",
-	gossh.ICRNL:         "icrnl",
-	gossh.IUCLC:         "iuclc",
-	gossh.IXON:          "ixon",
-	gossh.IXANY:         "ixany",
-	gossh.IXOFF:         "ixoff",
-	gossh.IMAXBEL:       "imaxbel",
-	gossh.IUTF8:         "iutf8",
-	gossh.ISIG:          "isig",
-	gossh.ICANON:        "icanon",
-	gossh.XCASE:         "xcase",
-	gossh.ECHO:          "echo",
-	gossh.ECHOE:         "echoe",
-	gossh.ECHOK:         "echok",
-	gossh.ECHONL:        "echonl",
-	gossh.NOFLSH:        "noflsh",
-	gossh.TOSTOP:        "tostop",
-	gossh.IEXTEN:        "iexten",
-	gossh.ECHOCTL:       "echoctl",
-	gossh.ECHOKE:        "echoke",
-	gossh.PENDIN:        "pendin",
-	gossh.OPOST:         "opost",
-	gossh.OLCUC:         "olcuc",
-	gossh.ONLCR:         "onlcr",
-	gossh.OCRNL:         "ocrnl",
-	gossh.ONOCR:         "onocr",
-	gossh.ONLRET:        "onlret",
-	gossh.CS7:           "cs7",
-	gossh.CS8:           "cs8",
-	gossh.PARENB:        "parenb",
-	gossh.PARODD:        "parodd",
-	gossh.TTY_OP_ISPEED: "tty_op_ispeed",
-	gossh.TTY_OP_OSPEED: "tty_op_ospeed",
+	ssh.VINTR:         "intr",
+	ssh.VQUIT:         "quit",
+	ssh.VERASE:        "erase",
+	ssh.VKILL:         "kill",
+	ssh.VEOF:          "eof",
+	ssh.VEOL:          "eol",
+	ssh.VEOL2:         "eol2",
+	ssh.VSTART:        "start",
+	ssh.VSTOP:         "stop",
+	ssh.VSUSP:         "susp",
+	ssh.VDSUSP:        "dsusp",
+	ssh.VREPRINT:      "rprnt",
+	ssh.VWERASE:       "werase",
+	ssh.VLNEXT:        "lnext",
+	ssh.VFLUSH:        "flush",
+	ssh.VSWTCH:        "swtch",
+	ssh.VSTATUS:       "status",
+	ssh.VDISCARD:      "discard",
+	ssh.IGNPAR:        "ignpar",
+	ssh.PARMRK:        "parmrk",
+	ssh.INPCK:         "inpck",
+	ssh.ISTRIP:        "istrip",
+	ssh.INLCR:         "inlcr",
+	ssh.IGNCR:         "igncr",
+	ssh.ICRNL:         "icrnl",
+	ssh.IUCLC:         "iuclc",
+	ssh.IXON:          "ixon",
+	ssh.IXANY:         "ixany",
+	ssh.IXOFF:         "ixoff",
+	ssh.IMAXBEL:       "imaxbel",
+	ssh.IUTF8:         "iutf8",
+	ssh.ISIG:          "isig",
+	ssh.ICANON:        "icanon",
+	ssh.XCASE:         "xcase",
+	ssh.ECHO:          "echo",
+	ssh.ECHOE:         "echoe",
+	ssh.ECHOK:         "echok",
+	ssh.ECHONL:        "echonl",
+	ssh.NOFLSH:        "noflsh",
+	ssh.TOSTOP:        "tostop",
+	ssh.IEXTEN:        "iexten",
+	ssh.ECHOCTL:       "echoctl",
+	ssh.ECHOKE:        "echoke",
+	ssh.PENDIN:        "pendin",
+	ssh.OPOST:         "opost",
+	ssh.OLCUC:         "olcuc",
+	ssh.ONLCR:         "onlcr",
+	ssh.OCRNL:         "ocrnl",
+	ssh.ONOCR:         "onocr",
+	ssh.ONLRET:        "onlret",
+	ssh.CS7:           "cs7",
+	ssh.CS8:           "cs8",
+	ssh.PARENB:        "parenb",
+	ssh.PARODD:        "parodd",
+	ssh.TTY_OP_ISPEED: "tty_op_ispeed",
+	ssh.TTY_OP_OSPEED: "tty_op_ospeed",
 }
 
 // startWithPTY starts cmd with a pseudo-terminal attached to Stdin, Stdout and Stderr.
@@ -932,11 +1011,11 @@ func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
 		tios.Col = int(ptyReq.Window.Width)
 
 		for c, v := range ptyReq.Modes {
-			if c == gossh.TTY_OP_ISPEED {
+			if c == ssh.TTY_OP_ISPEED {
 				tios.Ispeed = int(v)
 				continue
 			}
-			if c == gossh.TTY_OP_OSPEED {
+			if c == ssh.TTY_OP_OSPEED {
 				tios.Ospeed = int(v)
 				continue
 			}
