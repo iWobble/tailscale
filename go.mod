@@ -27,7 +27,7 @@ require (
 	github.com/creachadair/msync v0.7.1
 	github.com/creachadair/taskgroup v0.13.2
 	github.com/creack/pty v1.1.24
-	github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa
+	github.com/dblohm7/wingoes v0.0.0-20260526185140-fb298caac7ca
 	github.com/digitalocean/go-smbios v0.0.0-20180907143718-390a4f403a8e
 	github.com/distribution/reference v0.6.0
 	github.com/djherbis/times v1.6.0
@@ -118,7 +118,7 @@ require (
 	golang.org/x/net v0.53.0
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/sys v0.45.0
 	golang.org/x/term v0.42.0
 	golang.org/x/time v0.12.0
 	golang.org/x/tools v0.44.0
