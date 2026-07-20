@@ -64,7 +64,7 @@ require (
 	github.com/huin/goupnp v1.3.0
 	github.com/illarion/gonotify/v3 v3.0.2
 	github.com/inetaf/tcpproxy v0.0.0-20250203165043-ded522cbd03f
-	github.com/insomniacslk/dhcp v0.0.0-20231206064809-8c70d406f6d2
+	github.com/insomniacslk/dhcp v0.0.0-20260719225207-c76316d4aa82
 	github.com/jellydator/ttlcache/v3 v3.1.0
 	github.com/jsimonetti/rtnetlink v1.4.0
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
