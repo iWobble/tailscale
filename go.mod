@@ -16,7 +16,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.75.3
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.44.7
 	github.com/axiomhq/hyperloglog v0.0.0-20240319100328-84253e514e02
-	github.com/bradfitz/go-tool-cache v0.0.0-20260216153636-9e5201344fe5
+	github.com/bradfitz/go-tool-cache v0.0.0-20260723163732-0b25549eea9b
 	github.com/bradfitz/monogok v0.0.0-20260310223834-65a3d9465088
 	github.com/bramvdbogaerde/go-scp v1.4.0
 	github.com/cilium/ebpf v0.16.0
@@ -117,7 +117,7 @@ require (
 	golang.org/x/mod v0.35.0
 	golang.org/x/net v0.53.0
 	golang.org/x/oauth2 v0.36.0
-	golang.org/x/sync v0.20.0
+	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.43.0
 	golang.org/x/term v0.42.0
 	golang.org/x/time v0.12.0
